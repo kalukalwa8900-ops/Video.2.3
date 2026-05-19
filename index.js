@@ -6,6 +6,7 @@ const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 const { execSync, spawn } = require("child_process");
+const AdmZip = require("adm-zip");
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -238,6 +239,11 @@ const diskUpload = multer({
     fileSize: 2 * 1024 * 1024,  // 2MB per image
     files: 400                   // up to 400 images
   }
+});
+
+const zipUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 300 * 1024 * 1024, files: 1 }
 });
 
 // ================================
@@ -595,8 +601,12 @@ app.post(
       fs.writeFileSync(imagePath, imageBuffer);
 
       let audioPath = null;
+      let audioFileName = null;
       if (req.files?.audio && req.files.audio[0]) {
-        audioPath = path.join(panelDir, `audio.aac`);
+        const audioExt = extFor(req.files.audio[0], ".mp3");
+        const audioFileName_local = `audio${audioExt}`;
+        audioPath = path.join(panelDir, audioFileName_local);
+        audioFileName = audioFileName_local;
         fs.writeFileSync(audioPath, req.files.audio[0].buffer);
       }
 
@@ -609,7 +619,7 @@ app.post(
           duration,
           narration,
           image:       "image.jpg",
-          audio:       audioPath ? "audio.aac" : null,
+          audio:       audioFileName,
           uploaded_at: new Date().toISOString()
         }, null, 2)
       );
@@ -630,6 +640,115 @@ app.post(
     }
   }
 );
+
+// ================================
+// ZIP AUDIO UPLOAD ROUTE
+// ================================
+
+app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
+  try {
+    const projectId = safeName(req.body.project_id || req.body.projectId, "");
+    if (!projectId) {
+      return res.status(400).json({ success: false, error: "Missing project_id" });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: "audioZip file required" });
+    }
+
+    const projectDir = path.join(UPLOADS_ROOT, projectId);
+    if (!fs.existsSync(projectDir)) {
+      return res.status(404).json({ success: false, error: "Project not found. Upload panels first." });
+    }
+
+    const zip = new AdmZip(req.file.buffer);
+    const entries = zip.getEntries();
+
+    const mp3Entries = entries
+      .filter(e => !e.isDirectory)
+      .filter(e => {
+        const name = e.entryName.replace(/\\/g, "/");
+        if (name.includes("__MACOSX")) return false;
+        if (path.basename(name).startsWith(".")) return false;
+        return /\.mp3$/i.test(name);
+      })
+      .map(e => {
+        const base = path.basename(e.entryName);
+        const match = base.match(/^(\d+)\.mp3$/i);
+        return match ? { entry: e, num: Number(match[1]), file: base } : null;
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.num - b.num);
+
+    if (!mp3Entries.length) {
+      return res.status(400).json({
+        success: false,
+        error: "No valid numbered MP3 found. Use 1.mp3, 2.mp3, 3.mp3..."
+      });
+    }
+
+    const panelFolders = fs
+      .readdirSync(projectDir, { withFileTypes: true })
+      .filter(d => d.isDirectory())
+      .map(d => d.name)
+      .map(name => {
+        const dir = path.join(projectDir, name);
+        const metaPath = path.join(dir, "metadata.json");
+        if (!fs.existsSync(metaPath)) return null;
+        const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+        return { name, dir, metaPath, meta };
+      })
+      .filter(Boolean)
+      .sort((a, b) => Number(a.meta.index || 0) - Number(b.meta.index || 0));
+
+    const attached = [];
+    const missing = [];
+
+    for (let i = 0; i < panelFolders.length; i++) {
+      const panelNumber = i + 1;
+      const audio = mp3Entries.find(x => x.num === panelNumber);
+
+      if (!audio) {
+        missing.push(panelNumber);
+        continue;
+      }
+
+      const panel = panelFolders[i];
+      const outAudio = path.join(panel.dir, "audio.mp3");
+
+      fs.writeFileSync(outAudio, audio.entry.getData());
+
+      panel.meta.audio = "audio.mp3";
+      panel.meta.audio_source = "zip";
+      panel.meta.audio_original = audio.file;
+
+      fs.writeFileSync(panel.metaPath, JSON.stringify(panel.meta, null, 2));
+
+      attached.push({
+        panel: panelNumber,
+        image: panel.meta.image,
+        audio: audio.file,
+        status: "attached"
+      });
+    }
+
+    return res.json({
+      success: true,
+      project_id: projectId,
+      totalPanels: panelFolders.length,
+      totalMp3Found: mp3Entries.length,
+      attached,
+      missing,
+      message: missing.length
+        ? `Attached ${attached.length} audio files. Missing audio for panels: ${missing.join(", ")}`
+        : `All ${attached.length} MP3 files attached successfully.`
+    });
+
+  } catch (err) {
+    console.error("/audio-zip error:", err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
 
 // ================================
 // RENDER ROUTE (synchronous — waits and returns URL directly)
