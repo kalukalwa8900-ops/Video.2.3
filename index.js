@@ -71,26 +71,10 @@ app.use((req, _res, next) => {
 });
 
 // ================================
-// Internal API Security
+// No Token Authentication (Development/Testing)
 // ================================
 
 app.use((req, res, next) => {
-  if (
-    req.path.startsWith("/health") ||
-    req.path.startsWith("/output")
-  ) {
-    return next();
-  }
-
-  const token = req.headers["x-internal-token"];
-
-  if (token !== process.env.INTERNAL_TOKEN) {
-    return res.status(401).json({
-      success: false,
-      error: "Unauthorized renderer access"
-    });
-  }
-
   next();
 });
 
@@ -186,8 +170,7 @@ function cleanupFiles(files = []) {
 }
 
 // ================================
-// FIX 1: Get Audio Duration (improved)
-// Handles missing stream duration fallback to format.duration
+// Get Audio Duration (with fallback)
 // ================================
 
 function getAudioDuration(audioPath) {
@@ -206,20 +189,66 @@ function getAudioDuration(audioPath) {
         return resolve({ valid: false, reason: "No audio stream found" });
       }
 
-      // FIX 1: Try stream duration first, then format.duration, then 0
       const duration = parseFloat(
         audioStream.duration ||
         data.format?.duration ||
         0
       );
 
-      if (!duration || isNaN(duration) || duration <= 0) {
+      if (!duration || duration <= 0) {
         return resolve({ valid: false, reason: "Invalid audio duration" });
       }
 
       resolve({ valid: true, duration });
     });
   });
+}
+
+// ================================
+// Calculate Panel Duration (with priority order)
+// ================================
+
+async function calculatePanelDuration(panel) {
+  const PADDING = 0.2;
+
+  // Priority 1: ZIP MP3 audio (actual duration)
+  if (panel.audio && panel.audio_source === "zip") {
+    const audioPath = path.join(panel.dir, panel.audio);
+    const result = await getAudioDuration(audioPath);
+    if (result.valid) {
+      const duration = result.duration + PADDING;
+      console.log(`[panel ${panel.index + 1}] ${panel.audio} → ${result.duration.toFixed(1)} sec + ${PADDING} sec padding = ${duration.toFixed(1)} sec`);
+      return duration;
+    } else {
+      throw new Error(`Panel ${panel.index + 1} audio corrupted: ${result.reason}`);
+    }
+  }
+
+  // Priority 2: Edge TTS duration (from metadata)
+  if (panel.tts_duration && panel.tts_provider === "edge") {
+    const duration = panel.tts_duration + PADDING;
+    console.log(`[panel ${panel.index + 1}] Edge TTS → ${panel.tts_duration.toFixed(1)} sec + ${PADDING} sec padding = ${duration.toFixed(1)} sec`);
+    return duration;
+  }
+
+  // Priority 3: gTTS duration (from metadata)
+  if (panel.tts_duration && panel.tts_provider === "gtts") {
+    const duration = panel.tts_duration + PADDING;
+    console.log(`[panel ${panel.index + 1}] gTTS → ${panel.tts_duration.toFixed(1)} sec + ${PADDING} sec padding = ${duration.toFixed(1)} sec`);
+    return duration;
+  }
+
+  // Priority 4: Narration text fallback
+  if (panel.narration) {
+    const wordCount = String(panel.narration).split(/\s+/).filter(Boolean).length;
+    const duration = Math.max(3, Math.min(12, Math.round(wordCount / 2.3) + 1));
+    console.log(`[panel ${panel.index + 1}] narration (${wordCount} words) → ${duration} sec`);
+    return duration;
+  }
+
+  // Priority 5: Default
+  console.log(`[panel ${panel.index + 1}] no audio/narration → default 4 sec`);
+  return 4;
 }
 
 // ================================
@@ -254,65 +283,6 @@ function validateSegment(segPath) {
 }
 
 // ================================
-// Calculate Panel Duration (improved)
-// Priority: ZIP MP3 > Edge TTS > gTTS > Narration text > Default 4 sec
-// ================================
-
-async function calculatePanelDuration(panel, panelIndex, jobId) {
-  const PADDING = 0.2;
-
-  try {
-    // Priority 1: ZIP MP3 duration (actual audio file)
-    if (panel.audio && panel.dir) {
-      const audioPath = path.join(panel.dir, panel.audio);
-      if (fs.existsSync(audioPath)) {
-        const result = await getAudioDuration(audioPath);
-        if (result.valid) {
-          const totalDur = result.duration + PADDING;
-          console.log(`[${jobId}] panel ${panelIndex + 1} audio file → ${result.duration.toFixed(1)} sec + ${PADDING} sec padding = ${totalDur.toFixed(1)} sec`);
-          return Math.max(2, totalDur);
-        } else {
-          console.error(`[${jobId}] panel ${panelIndex + 1} audio corrupted: ${result.reason}`);
-          throw new Error(`Panel ${panelIndex + 1} audio corrupted: ${result.reason}`);
-        }
-      }
-    }
-
-    // Priority 2: Edge TTS duration
-    if (panel.tts_edge_duration) {
-      const totalDur = parseFloat(panel.tts_edge_duration) + PADDING;
-      console.log(`[${jobId}] panel ${panelIndex + 1} Edge TTS → ${panel.tts_edge_duration} sec + ${PADDING} sec padding = ${totalDur.toFixed(1)} sec`);
-      return Math.max(2, totalDur);
-    }
-
-    // Priority 3: gTTS duration
-    if (panel.tts_gtts_duration) {
-      const totalDur = parseFloat(panel.tts_gtts_duration) + PADDING;
-      console.log(`[${jobId}] panel ${panelIndex + 1} gTTS → ${panel.tts_gtts_duration} sec + ${PADDING} sec padding = ${totalDur.toFixed(1)} sec`);
-      return Math.max(2, totalDur);
-    }
-
-    // Priority 4: Narration text fallback
-    const narration = panel.narration || "";
-    const wordCount = narration.trim().split(/\s+/).filter(Boolean).length;
-    if (wordCount > 0) {
-      const dur = Math.max(3, Math.min(12, Math.round(wordCount / 2.3) + 1));
-      console.log(`[${jobId}] panel ${panelIndex + 1} narration (${wordCount} words) → ${dur} sec`);
-      return dur;
-    }
-
-    // Priority 5: Default 4 seconds
-    const defaultDur = 4;
-    console.log(`[${jobId}] panel ${panelIndex + 1} no audio/narration → default ${defaultDur} sec`);
-    return defaultDur;
-
-  } catch (err) {
-    console.error(`[${jobId}] Error calculating panel ${panelIndex + 1} duration:`, err.message);
-    throw err;
-  }
-}
-
-// ================================
 // Multer
 // ================================
 
@@ -332,8 +302,8 @@ const diskStorage = multer.diskStorage({
 const diskUpload = multer({
   storage: diskStorage,
   limits: {
-    fileSize: 2 * 1024 * 1024,
-    files: 400
+    fileSize: 2 * 1024 * 1024,  // 2MB per image
+    files: 400                   // up to 400 images
   }
 });
 
@@ -359,11 +329,22 @@ function getKenBurnsFilter(idx, duration) {
   const diagSpeed   = "1.8";
 
   const animations = [
+    // 0: Slow zoom in from center
     `${PRE},zoompan=z='min(zoom+${zoomInStep},1.5)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=${fps}`,
+
+    // 1: Slow zoom out to center
     `${PRE},zoompan=z='if(lte(zoom,1.0),${zoomOutStart},max(zoom-${zoomOutStep},1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=${fps}`,
+
+    // 2: Pan left to right with slight zoom
     `${PRE},zoompan=z='1.3':x='if(lte(on,1),0,min(x+${panSpeed},iw/zoom))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=${fps}`,
+
+    // 3: Pan right to left with slight zoom
     `${PRE},zoompan=z='1.3':x='if(lte(on,1),iw/zoom,max(x-${panSpeed},0))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=${fps}`,
+
+    // 4: Slide up (pan bottom to top)
     `${PRE},zoompan=z='1.3':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih/zoom,max(y-${diagSpeed},0))':d=${totalFrames}:s=1280x720:fps=${fps}`,
+
+    // 5: Slide down (pan top to bottom)
     `${PRE},zoompan=z='1.3':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),0,min(y+${diagSpeed},ih/zoom))':d=${totalFrames}:s=1280x720:fps=${fps}`,
   ];
 
@@ -371,7 +352,7 @@ function getKenBurnsFilter(idx, duration) {
 }
 
 // ================================
-// Create Segment
+// Create Segment (MP4)
 // ================================
 
 function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, simpleMode }) {
@@ -395,7 +376,7 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
     const hasAudio = audioPath && fs.existsSync(audioPath);
 
     const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-    console.log(`[${RENDERER_NAME}][seg${idx}] START — jobId=${jobId} dur=${duration.toFixed(1)}s fps=${fps} mem=${memMB}MB simpleMode=${useSimpleMode} hasAudio=${hasAudio}`);
+    console.log(`[${RENDERER_NAME}][seg${idx}] START — jobId=${jobId} style=${idx % 6} dur=${duration}s fps=${fps} mem=${memMB}MB simpleMode=${useSimpleMode}`);
 
     const cmd = ffmpeg()
       .setFfmpegPath(FFMPEG_PATH)
@@ -535,6 +516,10 @@ async function concatWithTransitions(segPaths, durations, outPath) {
   console.log(`[concat] END — mem=${memAfterMB}MB → ${outPath}`);
 }
 
+// ================================
+// xfade concat (≤30 clips)
+// ================================
+
 async function concatWithXfade(segPaths, durations, outPath) {
   const TRANSITION_DURATION = 0.5;
   const TRANSITION_TYPE     = "slideright";
@@ -586,6 +571,10 @@ async function concatWithXfade(segPaths, durations, outPath) {
   }
 }
 
+// ================================
+// simple concat (>30 clips or fallback)
+// ================================
+
 async function concatSimple(segPaths, outPath) {
   console.log(`[concat] Running simple concat (${segPaths.length} clips)...`);
   const concatFile = path.join(TEMP_ROOT, `concat_${Date.now()}.txt`);
@@ -615,11 +604,10 @@ async function concatSimple(segPaths, outPath) {
 }
 
 // ================================
-// FIX 4: RENDER VALIDATION (before starting render)
-// Check all panels for images and audio integrity
+// VALIDATION - Check all panels before render
 // ================================
 
-async function validateRenderPanels(panels, jobId) {
+async function validateRenderPanels(panels) {
   const errors = [];
 
   for (let i = 0; i < panels.length; i++) {
@@ -627,44 +615,36 @@ async function validateRenderPanels(panels, jobId) {
     const panelNum = i + 1;
 
     // Check image exists
-    if (!p.image || !p.dir) {
-      errors.push(`Panel ${panelNum} missing image metadata`);
+    if (!p.image || !fs.existsSync(path.join(p.dir, p.image))) {
+      errors.push(`Panel ${panelNum} image missing`);
       continue;
     }
 
-    const imagePath = path.join(p.dir, p.image);
-    if (!fs.existsSync(imagePath)) {
-      errors.push(`Panel ${panelNum} image missing: ${p.image}`);
-      continue;
-    }
+    console.log(`[validate] ✓ Panel ${panelNum} image valid`);
 
-    // Check audio if it exists
+    // Check audio exists and is valid (if audio is specified)
     if (p.audio) {
       const audioPath = path.join(p.dir, p.audio);
-
       if (!fs.existsSync(audioPath)) {
-        errors.push(`Panel ${panelNum} audio missing: ${p.audio}`);
+        errors.push(`Panel ${panelNum} missing audio`);
         continue;
       }
 
-      // Validate audio is readable by ffprobe
       const result = await getAudioDuration(audioPath);
       if (!result.valid) {
         errors.push(`Panel ${panelNum} audio corrupted: ${result.reason}`);
         continue;
       }
 
-      console.log(`[${jobId}] ✓ Panel ${panelNum} audio valid (${result.duration.toFixed(1)} sec)`);
+      console.log(`[validate] ✓ Panel ${panelNum} audio valid (${result.duration.toFixed(1)} sec)`);
     }
   }
 
   if (errors.length > 0) {
-    const errorMsg = errors.join(" | ");
-    console.error(`[${jobId}] ❌ Validation failed:\n${errors.map(e => `  - ${e}`).join("\n")}`);
     throw new Error(`Render validation failed:\n${errors.join("\n")}`);
   }
 
-  console.log(`[${jobId}] ✓ All ${panels.length} panels validated successfully`);
+  console.log(`[validate] ✓ All ${panels.length} panels validated successfully`);
 }
 
 // ================================
@@ -726,12 +706,10 @@ app.post(
 
       let audioPath = null;
       let audioFileName = null;
-
       if (req.files?.audio && req.files.audio[0]) {
         const audioExt = extFor(req.files.audio[0], ".mp3");
-        const audioFileNameLocal = `audio${audioExt}`;
-        audioPath = path.join(panelDir, audioFileNameLocal);
-        audioFileName = audioFileNameLocal;
+        audioFileName = `audio${audioExt}`;
+        audioPath = path.join(panelDir, audioFileName);
         fs.writeFileSync(audioPath, req.files.audio[0].buffer);
       }
 
@@ -767,7 +745,7 @@ app.post(
 );
 
 // ================================
-// AUDIO ZIP UPLOAD ROUTE (FIX 3: Flexible MP3 numbering)
+// AUDIO ZIP UPLOAD ROUTE
 // ================================
 
 app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
@@ -789,7 +767,6 @@ app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
     const zip = new AdmZip(req.file.buffer);
     const entries = zip.getEntries();
 
-    // FIX 3: Extract numbers flexibly from MP3 filenames
     const mp3Entries = entries
       .filter(e => !e.isDirectory)
       .filter(e => {
@@ -800,7 +777,6 @@ app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
       })
       .map(e => {
         const base = path.basename(e.entryName);
-        // FIX 3: Flexible number extraction (001.mp3, 1.mp3, panel_1.mp3, audio_2.mp3 all work)
         const match = base.match(/(\d+)/);
         return match ? { entry: e, num: Number(match[1]), file: base } : null;
       })
@@ -810,7 +786,7 @@ app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
     if (!mp3Entries.length) {
       return res.status(400).json({
         success: false,
-        error: "No valid numbered MP3 found. Use 1.mp3, 001.mp3, panel_1.mp3, audio_2.mp3, etc."
+        error: "No valid numbered MP3 found. Use 1.mp3, 2.mp3, 3.mp3, audio_1.mp3, panel_1.mp3, etc."
       });
     }
 
@@ -878,7 +854,7 @@ app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
 });
 
 // ================================
-// RENDER ROUTE
+// RENDER ROUTE (async background job)
 // ================================
 
 app.post("/render", (req, res) => {
@@ -956,7 +932,7 @@ async function renderFromProject(req, jobId) {
     const metaPath = path.join(dir, "metadata.json");
     if (!fs.existsSync(metaPath)) return null;
     const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
-    return { ...meta, dir };
+    return { ...meta, dir, index: fallbackIndex };
   };
 
   let panels = [];
@@ -991,19 +967,15 @@ async function renderFromProject(req, jobId) {
   const durations = [];
 
   try {
-    console.log(`[${RENDERER_NAME}][${jobId}] Starting render — ${panels.length} panels — batch ${batchIndex + 1}/${totalBatches}`);
+    console.log(`[${RENDERER_NAME}][${jobId}] Starting validation — ${panels.length} panels`);
+    await validateRenderPanels(panels);
 
-    // FIX 4: Validate all panels before rendering
-    await validateRenderPanels(panels, jobId);
-
-    console.log(`[${jobId}] ✓ All panels passed validation. Starting segment creation...`);
+    console.log(`[${RENDERER_NAME}][${jobId}] Starting render — ${panels.length} panels — batch ${batchIndex + 1}/${totalBatches} — simpleMode=${simpleMode}`);
 
     for (let i = 0; i < panels.length; i++) {
       const p   = panels[i];
-      
-      // FIX: Use calculated duration based on audio/narration/TTS
-      const dur = await calculatePanelDuration(p, i, jobId);
-      
+      p.index = i;
+      const dur = await calculatePanelDuration(p);
       const segPath = path.join(TEMP_ROOT, `seg_${jobId}_${i}.mp4`);
 
       await createSegment({
@@ -1065,7 +1037,7 @@ async function renderFromProject(req, jobId) {
 }
 
 // ================================
-// Legacy multipart render (background)
+// Render from multipart upload (background)
 // ================================
 
 async function renderFromMultipart(req, jobId) {
@@ -1092,7 +1064,7 @@ async function renderFromMultipart(req, jobId) {
 
     while (lines.length < req.files.length) lines.push("");
 
-    console.log(`[${RENDERER_NAME}][${jobId}] Starting multipart render — ${req.files.length} images — batch ${batchIndex + 1}/${totalBatches}`);
+    console.log(`[${RENDERER_NAME}][${jobId}] Starting multipart render — ${req.files.length} images — batch ${batchIndex + 1}/${totalBatches} — simpleMode=${simpleMode}`);
 
     for (let i = 0; i < req.files.length; i++) {
       const segPath  = path.join(TEMP_ROOT, `seg_${jobId}_${i}.mp4`);
@@ -1169,7 +1141,7 @@ app.use((req, res) => {
 });
 
 // ================================
-// Auto Cleanup (every 30 min — delete files older than 2 hours)
+// Auto Cleanup (every 30 min)
 // ================================
 
 setInterval(() => {
