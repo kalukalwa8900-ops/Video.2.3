@@ -186,6 +186,43 @@ function cleanupFiles(files = []) {
 }
 
 // ================================
+// FIX 1: Get Audio Duration (improved)
+// Handles missing stream duration fallback to format.duration
+// ================================
+
+function getAudioDuration(audioPath) {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(audioPath)) {
+      return resolve({ valid: false, reason: "Audio file does not exist" });
+    }
+
+    ffmpeg.ffprobe(audioPath, (err, data) => {
+      if (err) {
+        return resolve({ valid: false, reason: `ffprobe error: ${err.message}` });
+      }
+
+      const audioStream = data.streams?.find(s => s.codec_type === "audio");
+      if (!audioStream) {
+        return resolve({ valid: false, reason: "No audio stream found" });
+      }
+
+      // FIX 1: Try stream duration first, then format.duration, then 0
+      const duration = parseFloat(
+        audioStream.duration ||
+        data.format?.duration ||
+        0
+      );
+
+      if (!duration || isNaN(duration) || duration <= 0) {
+        return resolve({ valid: false, reason: "Invalid audio duration" });
+      }
+
+      resolve({ valid: true, duration });
+    });
+  });
+}
+
+// ================================
 // Validate Segment
 // ================================
 
@@ -217,6 +254,65 @@ function validateSegment(segPath) {
 }
 
 // ================================
+// Calculate Panel Duration (improved)
+// Priority: ZIP MP3 > Edge TTS > gTTS > Narration text > Default 4 sec
+// ================================
+
+async function calculatePanelDuration(panel, panelIndex, jobId) {
+  const PADDING = 0.2;
+
+  try {
+    // Priority 1: ZIP MP3 duration (actual audio file)
+    if (panel.audio && panel.dir) {
+      const audioPath = path.join(panel.dir, panel.audio);
+      if (fs.existsSync(audioPath)) {
+        const result = await getAudioDuration(audioPath);
+        if (result.valid) {
+          const totalDur = result.duration + PADDING;
+          console.log(`[${jobId}] panel ${panelIndex + 1} audio file → ${result.duration.toFixed(1)} sec + ${PADDING} sec padding = ${totalDur.toFixed(1)} sec`);
+          return Math.max(2, totalDur);
+        } else {
+          console.error(`[${jobId}] panel ${panelIndex + 1} audio corrupted: ${result.reason}`);
+          throw new Error(`Panel ${panelIndex + 1} audio corrupted: ${result.reason}`);
+        }
+      }
+    }
+
+    // Priority 2: Edge TTS duration
+    if (panel.tts_edge_duration) {
+      const totalDur = parseFloat(panel.tts_edge_duration) + PADDING;
+      console.log(`[${jobId}] panel ${panelIndex + 1} Edge TTS → ${panel.tts_edge_duration} sec + ${PADDING} sec padding = ${totalDur.toFixed(1)} sec`);
+      return Math.max(2, totalDur);
+    }
+
+    // Priority 3: gTTS duration
+    if (panel.tts_gtts_duration) {
+      const totalDur = parseFloat(panel.tts_gtts_duration) + PADDING;
+      console.log(`[${jobId}] panel ${panelIndex + 1} gTTS → ${panel.tts_gtts_duration} sec + ${PADDING} sec padding = ${totalDur.toFixed(1)} sec`);
+      return Math.max(2, totalDur);
+    }
+
+    // Priority 4: Narration text fallback
+    const narration = panel.narration || "";
+    const wordCount = narration.trim().split(/\s+/).filter(Boolean).length;
+    if (wordCount > 0) {
+      const dur = Math.max(3, Math.min(12, Math.round(wordCount / 2.3) + 1));
+      console.log(`[${jobId}] panel ${panelIndex + 1} narration (${wordCount} words) → ${dur} sec`);
+      return dur;
+    }
+
+    // Priority 5: Default 4 seconds
+    const defaultDur = 4;
+    console.log(`[${jobId}] panel ${panelIndex + 1} no audio/narration → default ${defaultDur} sec`);
+    return defaultDur;
+
+  } catch (err) {
+    console.error(`[${jobId}] Error calculating panel ${panelIndex + 1} duration:`, err.message);
+    throw err;
+  }
+}
+
+// ================================
 // Multer
 // ================================
 
@@ -236,8 +332,8 @@ const diskStorage = multer.diskStorage({
 const diskUpload = multer({
   storage: diskStorage,
   limits: {
-    fileSize: 2 * 1024 * 1024,  // 2MB per image
-    files: 400                   // up to 400 images
+    fileSize: 2 * 1024 * 1024,
+    files: 400
   }
 });
 
@@ -247,68 +343,50 @@ const zipUpload = multer({
 });
 
 // ================================
-// Create Segment (MP4 - always has audio)
-// ================================
-
-// ================================
 // Ken Burns Animation Presets
-// Cycles across panels so each one feels different
 // ================================
 
 function getKenBurnsFilter(idx, duration) {
-  // 20 fps — 20% less CPU/RAM vs 25fps, still visually smooth
   const fps = 20;
   const totalFrames = duration * fps;
 
-  // Pre-scale to 1920px wide — enough headroom for 1.5× zoom into 1280-wide output.
-  // scale=8000 was allocating ~180MB RAM per frame; 1920 brings that down to ~12MB.
   const PRE = "scale=1920:-1";
 
-  // Zoom/pan step tuned for 20fps so motion speed feels the same as before at 25fps
-  const zoomInStep  = "0.0019";   // was 0.0015 at 25fps
+  const zoomInStep  = "0.0019";
   const zoomOutStart = "1.5";
   const zoomOutStep = "0.0019";
-  const panSpeed    = "2.5";      // pixels/frame for lateral pans at 20fps
-  const diagSpeed   = "1.8";      // pixels/frame for vertical pans
+  const panSpeed    = "2.5";
+  const diagSpeed   = "1.8";
 
   const animations = [
-    // 0: Slow zoom in from center
     `${PRE},zoompan=z='min(zoom+${zoomInStep},1.5)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=${fps}`,
-
-    // 1: Slow zoom out to center
     `${PRE},zoompan=z='if(lte(zoom,1.0),${zoomOutStart},max(zoom-${zoomOutStep},1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=${fps}`,
-
-    // 2: Pan left to right with slight zoom
     `${PRE},zoompan=z='1.3':x='if(lte(on,1),0,min(x+${panSpeed},iw/zoom))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=${fps}`,
-
-    // 3: Pan right to left with slight zoom
     `${PRE},zoompan=z='1.3':x='if(lte(on,1),iw/zoom,max(x-${panSpeed},0))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=${fps}`,
-
-    // 4: Slide up (pan bottom to top)
     `${PRE},zoompan=z='1.3':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih/zoom,max(y-${diagSpeed},0))':d=${totalFrames}:s=1280x720:fps=${fps}`,
-
-    // 5: Slide down (pan top to bottom)
     `${PRE},zoompan=z='1.3':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),0,min(y+${diagSpeed},ih/zoom))':d=${totalFrames}:s=1280x720:fps=${fps}`,
   ];
 
   return animations[idx % animations.length];
 }
 
+// ================================
+// Create Segment
+// ================================
+
 function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, simpleMode }) {
   return new Promise((resolve, reject) => {
 
     const FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
     const wrapped = wrapText(text);
-    const fps = 20;  // reduced from 25 — 20% less CPU/RAM, still smooth
+    const fps = 20;
     const totalFrames = duration * fps;
 
-    // Auto simple mode: skip Ken Burns for large batches (saves RAM/CPU)
     const useSimpleMode = simpleMode === true;
     const kenBurns = useSimpleMode
       ? "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2"
       : getKenBurnsFilter(idx, duration);
 
-    // Build full video filter chain (no fade in/out)
     const vfParts = [
       kenBurns,
       "setsar=1"
@@ -317,7 +395,7 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
     const hasAudio = audioPath && fs.existsSync(audioPath);
 
     const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-    console.log(`[${RENDERER_NAME}][seg${idx}] START — jobId=${jobId} style=${idx % 6} dur=${duration}s fps=${fps} mem=${memMB}MB simpleMode=${useSimpleMode}`);
+    console.log(`[${RENDERER_NAME}][seg${idx}] START — jobId=${jobId} dur=${duration.toFixed(1)}s fps=${fps} mem=${memMB}MB simpleMode=${useSimpleMode} hasAudio=${hasAudio}`);
 
     const cmd = ffmpeg()
       .setFfmpegPath(FFMPEG_PATH)
@@ -342,6 +420,7 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
         "-movflags +faststart",
         "-c:a aac",
         "-b:a 128k",
+        "-shortest",
         `-t ${duration}`
       ])
       .output(outPath)
@@ -349,7 +428,7 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
         console.log(`[seg${idx}] FFmpeg started`);
       })
       .on("progress", (progress) => {
-        // suppress per-frame logs for 100-image jobs — too noisy
+        // suppress per-frame logs
       })
       .on("end", () => {
         const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
@@ -404,7 +483,7 @@ function spawnFfmpeg(args, description = "") {
         const isOOM = stderr.includes("Cannot allocate memory") ||
                       stderr.includes("Out of memory") ||
                       stderr.includes("ENOMEM") ||
-                      code === 137;   // SIGKILL — OOM killer
+                      code === 137;
         const label = isOOM ? "❌ OOM KILL" : "✗";
         const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
         const err = new Error(`FFmpeg ${isOOM ? "OOM" : `failed (code ${code})`}: ${description} — mem=${memMB}MB\n${stderr.slice(-800)}`);
@@ -421,9 +500,7 @@ function spawnFfmpeg(args, description = "") {
 }
 
 // ================================
-// CONCAT WITH TRANSITIONS (xfade/acrossfade)
-// Auto-falls back to simple concat for >30 segments to avoid
-// filter_complex graphs that crash FFmpeg on Railway free plan
+// CONCAT WITH TRANSITIONS
 // ================================
 
 async function concatWithTransitions(segPaths, durations, outPath) {
@@ -439,16 +516,12 @@ async function concatWithTransitions(segPaths, durations, outPath) {
     return;
   }
 
-  // ── Lightweight existence check only — no ffprobe overhead ──────────────
   for (let i = 0; i < n; i++) {
     if (!fs.existsSync(segPaths[i])) {
       throw new Error(`Segment ${i} missing: ${segPaths[i]}`);
     }
   }
 
-  // ── Choose strategy based on segment count ───────────────────────────────
-  // xfade filter_complex grows O(n) and is memory-intensive.
-  // Above 30 clips Railway's 1 GB limit is reliably breached — skip xfade.
   const USE_XFADE = n <= 30;
   console.log(`[concat] strategy=${USE_XFADE ? "xfade" : "simple-concat (>30 clips)"}`);
 
@@ -462,7 +535,6 @@ async function concatWithTransitions(segPaths, durations, outPath) {
   console.log(`[concat] END — mem=${memAfterMB}MB → ${outPath}`);
 }
 
-// ── xfade path (≤30 clips) ──────────────────────────────────────────────────
 async function concatWithXfade(segPaths, durations, outPath) {
   const TRANSITION_DURATION = 0.5;
   const TRANSITION_TYPE     = "slideright";
@@ -496,7 +568,7 @@ async function concatWithXfade(segPaths, durations, outPath) {
     "-c:v", "libx264",
     "-pix_fmt", "yuv420p",
     "-crf", "23",
-    "-preset", "ultrafast",   // was veryfast — saves ~30% encode time
+    "-preset", "ultrafast",
     "-movflags", "+faststart",
     "-c:a", "aac",
     "-b:a", "128k",
@@ -514,7 +586,6 @@ async function concatWithXfade(segPaths, durations, outPath) {
   }
 }
 
-// ── simple concat path (>30 clips, or xfade fallback) ──────────────────────
 async function concatSimple(segPaths, outPath) {
   console.log(`[concat] Running simple concat (${segPaths.length} clips)...`);
   const concatFile = path.join(TEMP_ROOT, `concat_${Date.now()}.txt`);
@@ -527,7 +598,7 @@ async function concatSimple(segPaths, outPath) {
     "-c:v", "libx264",
     "-pix_fmt", "yuv420p",
     "-crf", "23",
-    "-preset", "ultrafast",   // was veryfast
+    "-preset", "ultrafast",
     "-movflags", "+faststart",
     "-c:a", "aac",
     "-b:a", "128k",
@@ -541,6 +612,59 @@ async function concatSimple(segPaths, outPath) {
   } finally {
     try { fs.unlinkSync(concatFile); } catch (_) {}
   }
+}
+
+// ================================
+// FIX 4: RENDER VALIDATION (before starting render)
+// Check all panels for images and audio integrity
+// ================================
+
+async function validateRenderPanels(panels, jobId) {
+  const errors = [];
+
+  for (let i = 0; i < panels.length; i++) {
+    const p = panels[i];
+    const panelNum = i + 1;
+
+    // Check image exists
+    if (!p.image || !p.dir) {
+      errors.push(`Panel ${panelNum} missing image metadata`);
+      continue;
+    }
+
+    const imagePath = path.join(p.dir, p.image);
+    if (!fs.existsSync(imagePath)) {
+      errors.push(`Panel ${panelNum} image missing: ${p.image}`);
+      continue;
+    }
+
+    // Check audio if it exists
+    if (p.audio) {
+      const audioPath = path.join(p.dir, p.audio);
+
+      if (!fs.existsSync(audioPath)) {
+        errors.push(`Panel ${panelNum} audio missing: ${p.audio}`);
+        continue;
+      }
+
+      // Validate audio is readable by ffprobe
+      const result = await getAudioDuration(audioPath);
+      if (!result.valid) {
+        errors.push(`Panel ${panelNum} audio corrupted: ${result.reason}`);
+        continue;
+      }
+
+      console.log(`[${jobId}] ✓ Panel ${panelNum} audio valid (${result.duration.toFixed(1)} sec)`);
+    }
+  }
+
+  if (errors.length > 0) {
+    const errorMsg = errors.join(" | ");
+    console.error(`[${jobId}] ❌ Validation failed:\n${errors.map(e => `  - ${e}`).join("\n")}`);
+    throw new Error(`Render validation failed:\n${errors.join("\n")}`);
+  }
+
+  console.log(`[${jobId}] ✓ All ${panels.length} panels validated successfully`);
 }
 
 // ================================
@@ -602,11 +726,12 @@ app.post(
 
       let audioPath = null;
       let audioFileName = null;
+
       if (req.files?.audio && req.files.audio[0]) {
         const audioExt = extFor(req.files.audio[0], ".mp3");
-        const audioFileName_local = `audio${audioExt}`;
-        audioPath = path.join(panelDir, audioFileName_local);
-        audioFileName = audioFileName_local;
+        const audioFileNameLocal = `audio${audioExt}`;
+        audioPath = path.join(panelDir, audioFileNameLocal);
+        audioFileName = audioFileNameLocal;
         fs.writeFileSync(audioPath, req.files.audio[0].buffer);
       }
 
@@ -642,7 +767,7 @@ app.post(
 );
 
 // ================================
-// ZIP AUDIO UPLOAD ROUTE
+// AUDIO ZIP UPLOAD ROUTE (FIX 3: Flexible MP3 numbering)
 // ================================
 
 app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
@@ -664,6 +789,7 @@ app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
     const zip = new AdmZip(req.file.buffer);
     const entries = zip.getEntries();
 
+    // FIX 3: Extract numbers flexibly from MP3 filenames
     const mp3Entries = entries
       .filter(e => !e.isDirectory)
       .filter(e => {
@@ -674,7 +800,8 @@ app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
       })
       .map(e => {
         const base = path.basename(e.entryName);
-        const match = base.match(/^(\d+)\.mp3$/i);
+        // FIX 3: Flexible number extraction (001.mp3, 1.mp3, panel_1.mp3, audio_2.mp3 all work)
+        const match = base.match(/(\d+)/);
         return match ? { entry: e, num: Number(match[1]), file: base } : null;
       })
       .filter(Boolean)
@@ -683,7 +810,7 @@ app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
     if (!mp3Entries.length) {
       return res.status(400).json({
         success: false,
-        error: "No valid numbered MP3 found. Use 1.mp3, 2.mp3, 3.mp3..."
+        error: "No valid numbered MP3 found. Use 1.mp3, 001.mp3, panel_1.mp3, audio_2.mp3, etc."
       });
     }
 
@@ -751,18 +878,12 @@ app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
 });
 
 // ================================
-// RENDER ROUTE (synchronous — waits and returns URL directly)
-// ================================
-
-// ================================
-// RENDER ROUTE — responds immediately, renders in background
-// Client polls GET /status/:jobId for progress and final URL
+// RENDER ROUTE
 // ================================
 
 app.post("/render", (req, res) => {
   const hasProjectId = req.body?.project_id || req.body?.projectId;
 
-  // ── Project-based render (panels pre-uploaded via /panel) ───────────────
   if (hasProjectId) {
     const jobId = createJob();
     res.json({ success: true, jobId, status: "queued" });
@@ -777,7 +898,6 @@ app.post("/render", (req, res) => {
     return;
   }
 
-  // ── Multipart image upload render ────────────────────────────────────────
   diskUpload.array("images", 400)(req, res, (multerErr) => {
     if (multerErr) {
       console.error("[/render] Multer error:", multerErr.message);
@@ -871,11 +991,19 @@ async function renderFromProject(req, jobId) {
   const durations = [];
 
   try {
-    console.log(`[${RENDERER_NAME}][${jobId}] Starting render — ${panels.length} panels — batch ${batchIndex + 1}/${totalBatches} — simpleMode=${simpleMode}`);
+    console.log(`[${RENDERER_NAME}][${jobId}] Starting render — ${panels.length} panels — batch ${batchIndex + 1}/${totalBatches}`);
+
+    // FIX 4: Validate all panels before rendering
+    await validateRenderPanels(panels, jobId);
+
+    console.log(`[${jobId}] ✓ All panels passed validation. Starting segment creation...`);
 
     for (let i = 0; i < panels.length; i++) {
       const p   = panels[i];
-      const dur = Math.max(2, Number(p.duration) || 4);
+      
+      // FIX: Use calculated duration based on audio/narration/TTS
+      const dur = await calculatePanelDuration(p, i, jobId);
+      
       const segPath = path.join(TEMP_ROOT, `seg_${jobId}_${i}.mp4`);
 
       await createSegment({
@@ -964,7 +1092,7 @@ async function renderFromMultipart(req, jobId) {
 
     while (lines.length < req.files.length) lines.push("");
 
-    console.log(`[${RENDERER_NAME}][${jobId}] Starting multipart render — ${req.files.length} images — batch ${batchIndex + 1}/${totalBatches} — simpleMode=${simpleMode}`);
+    console.log(`[${RENDERER_NAME}][${jobId}] Starting multipart render — ${req.files.length} images — batch ${batchIndex + 1}/${totalBatches}`);
 
     for (let i = 0; i < req.files.length; i++) {
       const segPath  = path.join(TEMP_ROOT, `seg_${jobId}_${i}.mp4`);
