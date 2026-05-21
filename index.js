@@ -316,9 +316,9 @@ const zipUpload = multer({
 // Ken Burns Animation Presets
 // ================================
 
-function getKenBurnsFilter(idx, duration) {
-  const fps = 20;
-  const totalFrames = duration * fps;
+function getKenBurnsFilter(idx, duration, panelCount = 1) {
+  const fps = panelCount > 100 ? 12 : 20;
+  const totalFrames = Math.ceil(duration * fps);
 
   const PRE = "scale=1920:-1";
 
@@ -355,18 +355,12 @@ function getKenBurnsFilter(idx, duration) {
 // Create Segment (MP4)
 // ================================
 
-function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, simpleMode }) {
+function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount }) {
   return new Promise((resolve, reject) => {
 
     const FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
     const wrapped = wrapText(text);
-    const fps = 20;
-    const totalFrames = duration * fps;
-
-    const useSimpleMode = simpleMode === true;
-    const kenBurns = useSimpleMode
-      ? "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2"
-      : getKenBurnsFilter(idx, duration);
+    const kenBurns = getKenBurnsFilter(idx, duration, panelCount);
 
     const vfParts = [
       kenBurns,
@@ -376,7 +370,7 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
     const hasAudio = audioPath && fs.existsSync(audioPath);
 
     const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-    console.log(`[${RENDERER_NAME}][seg${idx}] START — jobId=${jobId} style=${idx % 6} dur=${duration}s fps=${fps} mem=${memMB}MB simpleMode=${useSimpleMode}`);
+    console.log(`[${RENDERER_NAME}][seg${idx}] START — jobId=${jobId} style=${idx % 6} dur=${duration}s panelCount=${panelCount} mem=${memMB}MB`);
 
     const cmd = ffmpeg()
       .setFfmpegPath(FFMPEG_PATH)
@@ -390,6 +384,9 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
         .input(`aevalsrc=0:channel_layout=stereo:sample_rate=44100:duration=${duration}`)
         .inputOptions(["-f lavfi"]);
     }
+
+    // Derive fps from panelCount to match getKenBurnsFilter
+    const fps = panelCount > 100 ? 12 : 20;
 
     cmd
       .outputOptions([
@@ -959,7 +956,7 @@ async function renderFromProject(req, jobId) {
 
   const batchIndex   = Number(req.body.batchIndex   || req.body.batch_index   || 0);
   const totalBatches = Number(req.body.totalBatches || req.body.total_batches || 1);
-  const simpleMode   = panels.length > 100;
+  const panelCount   = panels.length;
 
   updateJob(jobId, { batchIndex, totalBatches });
 
@@ -970,7 +967,7 @@ async function renderFromProject(req, jobId) {
     console.log(`[${RENDERER_NAME}][${jobId}] Starting validation — ${panels.length} panels`);
     await validateRenderPanels(panels);
 
-    console.log(`[${RENDERER_NAME}][${jobId}] Starting render — ${panels.length} panels — batch ${batchIndex + 1}/${totalBatches} — simpleMode=${simpleMode}`);
+    console.log(`[${RENDERER_NAME}][${jobId}] Starting render — ${panels.length} panels — batch ${batchIndex + 1}/${totalBatches} — panelCount=${panelCount}`);
 
     for (let i = 0; i < panels.length; i++) {
       const p   = panels[i];
@@ -986,7 +983,7 @@ async function renderFromProject(req, jobId) {
         outPath:   segPath,
         jobId,
         idx: i,
-        simpleMode
+        panelCount
       });
 
       segPaths.push(segPath);
@@ -1053,7 +1050,7 @@ async function renderFromMultipart(req, jobId) {
 
   const batchIndex   = Number(req.body.batchIndex   || req.body.batch_index   || 0);
   const totalBatches = Number(req.body.totalBatches || req.body.total_batches || 1);
-  const simpleMode   = req.files.length > 100;
+  const panelCount   = req.files.length;
 
   updateJob(jobId, { batchIndex, totalBatches });
 
@@ -1064,7 +1061,7 @@ async function renderFromMultipart(req, jobId) {
 
     while (lines.length < req.files.length) lines.push("");
 
-    console.log(`[${RENDERER_NAME}][${jobId}] Starting multipart render — ${req.files.length} images — batch ${batchIndex + 1}/${totalBatches} — simpleMode=${simpleMode}`);
+    console.log(`[${RENDERER_NAME}][${jobId}] Starting multipart render — ${req.files.length} images — batch ${batchIndex + 1}/${totalBatches} — panelCount=${panelCount}`);
 
     for (let i = 0; i < req.files.length; i++) {
       const segPath  = path.join(TEMP_ROOT, `seg_${jobId}_${i}.mp4`);
@@ -1079,7 +1076,7 @@ async function renderFromMultipart(req, jobId) {
         outPath:   segPath,
         jobId,
         idx: i,
-        simpleMode
+        panelCount
       });
 
       segPaths.push(segPath);
