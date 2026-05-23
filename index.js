@@ -7,10 +7,23 @@ const fs = require("fs");
 const crypto = require("crypto");
 const { execSync, spawn } = require("child_process");
 const AdmZip = require("adm-zip");
+const FormData = require("form-data");
+// node-fetch v2 for CommonJS compatibility on Railway
+const fetch = require("node-fetch");  // node-fetch@2 — CommonJS, supports res.buffer()
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 const RENDERER_NAME = process.env.RENDERER_NAME || "renderer";
+
+// ================================
+// Distributed Renderer Config
+// ================================
+const RENDERER_URLS = (process.env.RENDERER_URLS || "")
+  .split(",")
+  .map(u => u.trim())
+  .filter(Boolean);
+
+console.log(`✓ Distributed renderers: ${RENDERER_URLS.length > 0 ? RENDERER_URLS.length : "none (single-server mode)"}`);
 
 // ================================
 // FFmpeg Detection & Validation
@@ -211,8 +224,8 @@ function getAudioDuration(audioPath) {
 async function calculatePanelDuration(panel) {
   const PADDING = 0.2;
 
-  // Priority 1: ZIP MP3 audio (actual duration)
-  if (panel.audio && panel.audio_source === "zip") {
+  // Priority 1: Any uploaded audio (zip or panel-direct) — probe for actual duration
+  if (panel.audio && (panel.audio_source === "zip" || panel.audio_source === "panel")) {
     const audioPath = path.join(panel.dir, panel.audio);
     const result = await getAudioDuration(audioPath);
     if (result.valid) {
@@ -310,7 +323,7 @@ const diskUpload = multer({
 
 const zipUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 300 * 1024 * 1024, files: 1 }
+  limits: { fileSize: 1000 * 1024 * 1024, files: 1 }  // 1GB — chunk ZIPs can exceed 300MB
 });
 
 // ================================
@@ -333,7 +346,7 @@ function getKenBurnsFilter(idx, duration, panelCount = 1) {
   const fps = getFps(panelCount);
   const totalFrames = Math.ceil(duration * fps);
 
-  const PRE = "scale=1920:-1";
+  const PRE = "scale=1280:-1";  // Match output resolution — avoids wasted upscale RAM
 
   const zoomInStep  = "0.0019";
   const zoomOutStart = "1.5";
@@ -379,6 +392,21 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
       kenBurns,
       "setsar=1"
     ];
+
+    // Apply subtitle overlay if there is narration text and the font exists
+    if (wrapped && fs.existsSync(FONT)) {
+      // Escape special drawtext characters: \, ', :
+      const escaped = wrapped
+        .replace(/\\/g, "\\\\")
+        .replace(/'/g, "\u2019")
+        .replace(/:/g, "\\:");
+      vfParts.push(
+        `drawtext=fontfile='${FONT}':text='${escaped}':fontcolor=white:fontsize=28` +
+        `:borderw=2:bordercolor=black@0.8` +
+        `:x=(w-text_w)/2:y=h-th-40` +
+        `:line_spacing=6`
+      );
+    }
 
     const hasAudio = audioPath && fs.existsSync(audioPath);
 
@@ -444,17 +472,26 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
 }
 
 // ================================
-// CHANGE 3: createSegment with retry + skip on failure
+// createSegment with retry — THROWS on failure (no silent panel skipping)
+// Skipping panels silently breaks story continuity in novel/comic videos.
 // ================================
 
 async function createSegmentSafe({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount }) {
-  const MAX_RETRIES = 2;
+  const MAX_RETRIES = 3;
   let lastErr;
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
       await createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount });
-      return { success: true };
+
+      // Validate the produced segment has both video and audio streams before proceeding.
+      // Catches silent FFmpeg failures where the process exits 0 but output is corrupt.
+      const check = await validateSegment(outPath);
+      if (!check.valid) {
+        throw new Error(`Segment validation failed: ${check.reason}`);
+      }
+
+      return;
     } catch (err) {
       lastErr = err;
       const isOOM = err.message.includes("Cannot allocate memory") ||
@@ -462,16 +499,18 @@ async function createSegmentSafe({ imagePath, audioPath, text, duration, outPath
                     err.message.includes("ENOMEM") ||
                     err.message.includes("killed");
       console.warn(`[seg${idx}] attempt ${attempt}/${MAX_RETRIES} failed${isOOM ? " (OOM)" : ""}: ${err.message.split("\n")[0]}`);
-      if (isOOM) {
-        // Wait before retry to let memory recover
-        await new Promise(r => setTimeout(r, 3000 * attempt));
+      if (attempt < MAX_RETRIES) {
+        const waitMs = isOOM ? 4000 * attempt : 1000 * attempt;
+        console.warn(`[seg${idx}] waiting ${waitMs}ms before retry...`);
+        await new Promise(r => setTimeout(r, waitMs));
       }
     }
   }
 
-  // All retries failed — log and return failure so caller can skip
-  console.error(`[seg${idx}] ❌ ALL RETRIES FAILED — skipping panel. Last error: ${lastErr.message.split("\n")[0]}`);
-  return { success: false, error: lastErr.message };
+  // All retries exhausted — throw so the job fails with a clear panel number
+  const msg = `Panel ${idx + 1} failed after ${MAX_RETRIES} attempts: ${lastErr.message.split("\n")[0]}`;
+  console.error(`[seg${idx}] ❌ FATAL — ${msg}`);
+  throw new Error(msg);
 }
 
 // ================================
@@ -604,10 +643,10 @@ async function batchMerge(segPaths, durations, outPath) {
     console.log(`[batchMerge] batch ${b + 1} done — mem=${memMB}MB`);
   }
 
-  // Recursively merge the batch outputs
+  // Simple concat batch outputs — safer for 500+ panels (avoids xfade memory risk)
   console.log(`[batchMerge] Merging ${batchOutputs.length} batch files → final`);
   try {
-    await concatWithTransitions(batchOutputs, batchDurations, outPath);
+    await concatSimple(batchOutputs, outPath);
   } finally {
     cleanupFiles(tempFiles);
   }
@@ -766,6 +805,32 @@ app.get("/status/:jobId", (req, res) => {
   if (!job) {
     return res.status(404).json({ success: false, error: "Job not found" });
   }
+
+  // For distributed jobs, include per-part breakdown
+  if (job.type === "distributed") {
+    return res.json({
+      success: true,
+      jobId: req.params.jobId,
+      status: job.status,
+      phase: job.phase,
+      progress: job.progress,
+      totalPanels: job.totalPanels,
+      numParts: job.numParts,
+      parts: (job.parts || []).map(p => ({
+        part: p.partIndex + 1,
+        renderer: p.renderer,
+        panelCount: p.panelCount,
+        status: p.status,
+        progress: p.progress,
+        remoteJobId: p.remoteJobId,
+        error: p.error || null
+      })),
+      url: job.url || null,
+      error: job.error || null,
+      createdAt: job.createdAt
+    });
+  }
+
   res.json({ success: true, ...job });
 });
 
@@ -803,11 +868,13 @@ app.post(
 
       let audioPath = null;
       let audioFileName = null;
+      let audioSource = null;
       if (req.files?.audio && req.files.audio[0]) {
         const audioExt = extFor(req.files.audio[0], ".mp3");
         audioFileName = `audio${audioExt}`;
         audioPath = path.join(panelDir, audioFileName);
         fs.writeFileSync(audioPath, req.files.audio[0].buffer);
+        audioSource = "panel";  // marks audio as uploaded directly (enables ffprobe duration)
       }
 
       const index = Number(req.body.index || 0);
@@ -818,9 +885,10 @@ app.post(
           index,
           duration,
           narration,
-          image:       "image.jpg",
-          audio:       audioFileName,
-          uploaded_at: new Date().toISOString()
+          image:        "image.jpg",
+          audio:        audioFileName,
+          audio_source: audioSource,
+          uploaded_at:  new Date().toISOString()
         }, null, 2)
       );
 
@@ -951,6 +1019,61 @@ app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
 });
 
 // ================================
+// RENDER CHUNK ZIP ROUTE (called by master on each remote renderer)
+// ================================
+
+app.post("/render-chunk-zip", zipUpload.single("chunkZip"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: "chunkZip file required" });
+    }
+
+    // Create a temp project ID for this chunk
+    const chunkProjectId = `chunk_${crypto.randomBytes(8).toString("hex")}`;
+    const chunkProjectDir = path.join(UPLOADS_ROOT, chunkProjectId);
+    fs.mkdirSync(chunkProjectDir, { recursive: true });
+
+    // Extract the ZIP into the temp project folder
+    const zip = new AdmZip(req.file.buffer);
+    zip.extractAllTo(chunkProjectDir, true);
+
+    console.log(`[render-chunk-zip] Extracted chunk to ${chunkProjectDir}`);
+
+    // Queue a render job using existing renderFromProject logic
+    const jobId = createJob();
+    updateJob(jobId, { chunkProjectId });
+
+    res.json({ success: true, jobId, status: "queued", chunkProjectId });
+
+    // Synthesize a req-like object for renderFromProject
+    const fakeReq = {
+      body: {
+        project_id: chunkProjectId,
+        panels: null
+      },
+      get: (h) => req.get(h)
+    };
+
+    setImmediate(() => {
+      renderFromProject(fakeReq, jobId).catch((err) => {
+        console.error(`[chunk-render][${jobId}] Error:`, err.message);
+        updateJob(jobId, { status: "error", error: err.message });
+        scheduleJobEviction(jobId);
+      });
+    });
+
+    // Schedule chunk project cleanup after 3 hours
+    setTimeout(() => {
+      try { fs.rmSync(chunkProjectDir, { recursive: true, force: true }); } catch (_) {}
+    }, 3 * 60 * 60 * 1000);
+
+  } catch (err) {
+    console.error("/render-chunk-zip error:", err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ================================
 // RENDER ROUTE (async background job)
 // ================================
 
@@ -989,6 +1112,406 @@ app.post("/render", (req, res) => {
     });
   });
 });
+
+// ================================
+// Distributed Render Helpers
+// ================================
+
+// node-fetch v2's { timeout } option only covers the connection phase, not slow
+// response bodies. This wrapper enforces a hard wall-clock deadline that aborts
+// the entire request — including a stalled download body.
+//
+// AbortController is built-in from Node 16+. On Node 14 it is not available
+// globally, so we fall back to a Promise.race timeout that at minimum surfaces
+// a clear timeout error rather than hanging forever.
+function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
+  const AbortCtrl = typeof AbortController !== "undefined" ? AbortController : null;
+
+  if (AbortCtrl) {
+    // Node 16+ path: true abort — tears down the socket immediately on timeout
+    const controller = new AbortCtrl();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    return fetch(url, { ...options, signal: controller.signal })
+      .finally(() => clearTimeout(timer));
+  }
+
+  // Node 14 fallback: race the fetch against a rejection timer.
+  // The fetch will still run to completion in the background, but callers
+  // receive the timeout error promptly and can move on / retry.
+  const timeoutPromise = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(`Request timed out after ${timeoutMs}ms: ${url}`)), timeoutMs)
+  );
+  return Promise.race([fetch(url, options), timeoutPromise]);
+}
+
+// Split an array into N roughly-equal chunks
+function splitIntoChunks(arr, n) {
+  const chunks = [];
+  const size = Math.ceil(arr.length / n);
+  for (let i = 0; i < arr.length; i += size) {
+    chunks.push(arr.slice(i, i + size));
+  }
+  return chunks;
+}
+
+// Build a ZIP buffer for a panel chunk
+// Structure: <panelId>/image.jpg, <panelId>/audio.mp3, <panelId>/metadata.json
+function buildChunkZip(panels) {
+  const zip = new AdmZip();
+
+  for (const panel of panels) {
+    const panelId = path.basename(panel.dir);
+
+    // Add image
+    const imagePath = path.join(panel.dir, panel.image);
+    if (fs.existsSync(imagePath)) {
+      zip.addLocalFile(imagePath, panelId, panel.image);
+    }
+
+    // Add audio if present
+    if (panel.audio) {
+      const audioPath = path.join(panel.dir, panel.audio);
+      if (fs.existsSync(audioPath)) {
+        zip.addLocalFile(audioPath, panelId, panel.audio);
+      }
+    }
+
+    // Add metadata — rewrite index to be relative within chunk
+    const meta = {
+      index:        panel._chunkIndex,
+      duration:     panel.duration,
+      narration:    panel.narration    || "",
+      image:        panel.image,
+      audio:        panel.audio        || null,
+      audio_source: panel.audio_source || null,
+      tts_duration: panel.tts_duration || null,
+      tts_provider: panel.tts_provider || null
+    };
+    zip.addFile(
+      `${panelId}/metadata.json`,
+      Buffer.from(JSON.stringify(meta, null, 2), "utf8")
+    );
+  }
+
+  return zip.toBuffer();
+}
+
+// Poll a remote /status/:jobId until done or error, with timeout
+async function pollRemoteStatus(rendererUrl, remoteJobId, masterJobId, partIndex, timeoutMs = 90 * 60 * 1000) {
+  const POLL_INTERVAL = 5000;
+  const deadline = Date.now() + timeoutMs;
+
+  console.log(`[distributed][part${partIndex + 1}] Polling ${rendererUrl}/status/${remoteJobId}`);
+
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, POLL_INTERVAL));
+
+    try {
+      const res = await fetchWithTimeout(`${rendererUrl}/status/${remoteJobId}`, {}, 15000);
+
+      if (!res.ok) {
+        console.warn(`[distributed][part${partIndex + 1}] Poll HTTP ${res.status} — retrying`);
+        continue;
+      }
+
+      const data = await res.json();
+
+      // Forward remote progress into master job parts array
+      if (jobs[masterJobId] && jobs[masterJobId].parts && jobs[masterJobId].parts[partIndex]) {
+        jobs[masterJobId].parts[partIndex].progress = data.progress || 0;
+      }
+
+      if (data.status === "done") {
+        console.log(`[distributed][part${partIndex + 1}] ✓ Remote render done`);
+        return { success: true, url: data.url || data.videoUrl || data.video_url || data.download_url };
+      }
+
+      if (data.status === "error") {
+        throw new Error(`Remote renderer ${rendererUrl} part ${partIndex + 1} failed: ${data.error}`);
+      }
+
+    } catch (err) {
+      // Re-throw hard renderer failures immediately
+      if (err.message.includes("Remote renderer")) throw err;
+      // Network blip — keep retrying until timeout
+      console.warn(`[distributed][part${partIndex + 1}] Poll error (will retry): ${err.message}`);
+    }
+  }
+
+  throw new Error(`Renderer ${rendererUrl} part ${partIndex + 1} timed out after ${timeoutMs / 60000} min`);
+}
+
+// Download a remote MP4 to a local temp path
+async function downloadPartVideo(url, destPath, partIndex) {
+  console.log(`[distributed][part${partIndex + 1}] Downloading ${url} → ${destPath}`);
+  const res = await fetchWithTimeout(url, {}, 10 * 60 * 1000);
+  if (!res.ok) throw new Error(`Failed to download part ${partIndex + 1}: HTTP ${res.status}`);
+
+  const buffer = await res.buffer();
+  fs.writeFileSync(destPath, buffer);
+  console.log(`[distributed][part${partIndex + 1}] ✓ Downloaded (${(buffer.length / 1024 / 1024).toFixed(1)} MB)`);
+}
+
+// Send chunk ZIP to a remote renderer and get back a remote jobId
+async function sendChunkToRenderer(rendererUrl, zipBuffer, partIndex) {
+  console.log(`[distributed][part${partIndex + 1}] Sending chunk to ${rendererUrl}/render-chunk-zip`);
+
+  const form = new FormData();
+  form.append("chunkZip", zipBuffer, {
+    filename:    `chunk_part${partIndex + 1}.zip`,
+    contentType: "application/zip"
+  });
+
+  const res = await fetchWithTimeout(`${rendererUrl}/render-chunk-zip`, {
+    method:  "POST",
+    body:    form,
+    headers: form.getHeaders()
+  }, 5 * 60 * 1000);  // 5 min upload timeout
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Renderer ${rendererUrl} rejected chunk upload (HTTP ${res.status}): ${text.slice(0, 200)}`);
+  }
+
+  const data = await res.json();
+  if (!data.jobId) throw new Error(`Renderer ${rendererUrl} returned no jobId`);
+
+  console.log(`[distributed][part${partIndex + 1}] ✓ Remote jobId: ${data.jobId}`);
+  return data.jobId;
+}
+
+// ================================
+// RENDER DISTRIBUTED ROUTE
+// ================================
+
+app.post("/render-distributed", async (req, res) => {
+  if (!RENDERER_URLS.length) {
+    return res.status(400).json({
+      success: false,
+      error: "No RENDERER_URLS configured. Set RENDERER_URLS env var with comma-separated renderer URLs."
+    });
+  }
+
+  const projectId = safeName(req.body.project_id || req.body.projectId, "");
+  if (!projectId) {
+    return res.status(400).json({ success: false, error: "Missing project_id" });
+  }
+
+  const projectDir = path.join(UPLOADS_ROOT, projectId);
+  if (!fs.existsSync(projectDir)) {
+    return res.status(404).json({
+      success: false,
+      error: `No uploaded panels found for project_id: ${projectId}`
+    });
+  }
+
+  // Read and sort all panels by metadata index
+  const panelFolders = fs
+    .readdirSync(projectDir, { withFileTypes: true })
+    .filter(d => d.isDirectory())
+    .map(d => {
+      const dir      = path.join(projectDir, d.name);
+      const metaPath = path.join(dir, "metadata.json");
+      if (!fs.existsSync(metaPath)) return null;
+      try {
+        const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+        return { ...meta, dir };
+      } catch (_) { return null; }
+    })
+    .filter(Boolean)
+    .sort((a, b) => Number(a.index || 0) - Number(b.index || 0));
+
+  if (!panelFolders.length) {
+    return res.status(400).json({ success: false, error: "No valid panels found in project" });
+  }
+
+  // Use however many renderers are available (up to RENDERER_URLS.length)
+  const numRenderers = Math.min(RENDERER_URLS.length, panelFolders.length);
+  const chunks       = splitIntoChunks(panelFolders, numRenderers);
+
+  // Create master distributed job
+  const jobId    = createJob();
+  jobs[jobId] = {
+    ...jobs[jobId],
+    type:        "distributed",
+    project_id:  projectId,
+    totalPanels: panelFolders.length,
+    numParts:    chunks.length,
+    parts:       chunks.map((chunk, i) => ({
+      partIndex:   i,
+      renderer:    RENDERER_URLS[i],
+      panelCount:  chunk.length,
+      status:      "queued",
+      progress:    0,
+      remoteJobId: null,
+      videoUrl:    null,
+      error:       null
+    })),
+    phase:    "sending_chunks",
+    status:   "processing",
+    progress: 0,
+    url:      null,
+    error:    null
+  };
+
+  // Respond immediately with jobId — client polls /status/:jobId
+  res.json({
+    success:     true,
+    jobId,
+    status:      "processing",
+    totalPanels: panelFolders.length,
+    numParts:    chunks.length,
+    renderers:   RENDERER_URLS.slice(0, numRenderers)
+  });
+
+  // Run distributed render in background
+  setImmediate(() =>
+    runDistributedRender(jobId, projectId, chunks, req).catch(err => {
+      console.error(`[distributed][${jobId}] Unhandled error:`, err.message);
+      updateJob(jobId, { status: "error", error: err.message });
+      scheduleJobEviction(jobId);
+    })
+  );
+});
+
+// ================================
+// Distributed Render Background Task
+// ================================
+
+async function runDistributedRender(jobId, projectId, chunks, req) {
+  const downloadedParts = [];
+
+  console.log(`\n[distributed][${jobId}] Starting — ${chunks.length} parts across ${chunks.length} renderers`);
+
+  try {
+
+    // ── Phase 1: Build each ZIP and send sequentially — one at a time to avoid RAM spike.
+    //    Each buffer is built, uploaded, then released before the next is built.
+    //    Remote renderers start immediately on receipt, so all 5 render in parallel
+    //    even though the master uploads them one by one.
+    updateJob(jobId, { phase: "sending_chunks", progress: 5 });
+
+    const remoteJobIds = [];
+    for (let i = 0; i < chunks.length; i++) {
+      try {
+        const memBefore = Math.round(process.memoryUsage().rss / 1024 / 1024);
+        console.log(`[distributed][${jobId}] Building ZIP part ${i + 1}/${chunks.length} — mem=${memBefore}MB`);
+
+        const panelsWithIdx = chunks[i].map((p, ci) => ({ ...p, _chunkIndex: ci }));
+        const zipBuffer     = buildChunkZip(panelsWithIdx);
+
+        const zipMB = (zipBuffer.length / 1024 / 1024).toFixed(1);
+        console.log(`[distributed][${jobId}] ZIP part ${i + 1} = ${zipMB}MB — uploading...`);
+
+        const remoteJobId = await sendChunkToRenderer(RENDERER_URLS[i], zipBuffer, i);
+
+        // Drop reference so GC can reclaim the ZIP buffer memory on the next cycle.
+        // Do NOT call fill(0) here — on 300–500MB ZIPs it causes a full buffer
+        // rewrite that spikes CPU and RAM pressure with no security benefit.
+
+        jobs[jobId].parts[i].status      = "rendering";
+        jobs[jobId].parts[i].remoteJobId = remoteJobId;
+        remoteJobIds.push(remoteJobId);
+
+        const uploadPct = 5 + Math.round(((i + 1) / chunks.length) * 10);
+        updateJob(jobId, { progress: uploadPct });
+        console.log(`[distributed][${jobId}] Part ${i + 1} sent → remote job ${remoteJobId}`);
+
+      } catch (err) {
+        jobs[jobId].parts[i].status = "error";
+        jobs[jobId].parts[i].error  = err.message;
+        throw new Error(`Part ${i + 1} upload failed (${RENDERER_URLS[i]}): ${err.message}`);
+      }
+    }
+
+    updateJob(jobId, { phase: "remote_rendering", progress: 15 });
+    console.log(`[distributed][${jobId}] All ${chunks.length} chunks sent — polling for completion...`);
+
+    // ── Phase 2: Poll all renderers in parallel until each finishes ──
+    const partResults = await Promise.all(
+      remoteJobIds.map(async (remoteJobId, i) => {
+        try {
+          const result = await pollRemoteStatus(RENDERER_URLS[i], remoteJobId, jobId, i);
+
+          jobs[jobId].parts[i].status   = "done";
+          jobs[jobId].parts[i].videoUrl = result.url;
+          jobs[jobId].parts[i].progress = 100;
+
+          // Update overall progress: 15–80% across remote renders
+          const doneParts = jobs[jobId].parts.filter(p => p.status === "done").length;
+          const pct       = 15 + Math.round((doneParts / chunks.length) * 65);
+          updateJob(jobId, { progress: pct });
+
+          return result;
+
+        } catch (err) {
+          jobs[jobId].parts[i].status = "error";
+          jobs[jobId].parts[i].error  = err.message;
+          throw err;
+        }
+      })
+    );
+
+    updateJob(jobId, { phase: "downloading_parts", progress: 80 });
+    console.log(`[distributed][${jobId}] All remote renders done — downloading part videos...`);
+
+    // ── Phase 3: Download part videos in order (sequential to avoid RAM spike) ──
+    for (let i = 0; i < partResults.length; i++) {
+      const destPath = path.join(TEMP_ROOT, `dist_${jobId}_part${i}.mp4`);
+      await downloadPartVideo(partResults[i].url, destPath, i);
+      downloadedParts.push(destPath);
+    }
+
+    updateJob(jobId, { phase: "merging", progress: 88 });
+    console.log(`[distributed][${jobId}] Merging ${downloadedParts.length} part videos...`);
+
+    // ── Phase 4: Simple concat merge of the 5 part files (no xfade between parts) ──
+    const finalPath = path.join(OUTPUT_ROOT, `${jobId}_final.mp4`);
+    await concatSimple(downloadedParts, finalPath);
+
+    // Cleanup downloaded part files immediately
+    cleanupFiles(downloadedParts);
+
+    const host = `https://${process.env.RAILWAY_PUBLIC_DOMAIN || req.get("host")}`;
+    const url  = `${host}/output/${jobId}_final.mp4`;
+
+    // Schedule final video eviction after 2 hours
+    setTimeout(() => {
+      try { fs.unlinkSync(finalPath); } catch (_) {}
+    }, 2 * 60 * 60 * 1000);
+
+    updateJob(jobId, {
+      status:       "done",
+      phase:        "done",
+      progress:     100,
+      url,
+      videoUrl:     url,
+      video_url:    url,
+      download_url: url,
+      project_id:   projectId,
+      totalPanels:  chunks.flat().length,
+      numParts:     chunks.length,
+      renderer:     RENDERER_NAME,
+      format:       "MP4 (H264 Video + AAC Audio)"
+    });
+
+    scheduleJobEviction(jobId);
+    console.log(`[distributed][${jobId}] ✓ Done → ${url}`);
+
+  } catch (err) {
+    console.error(`[distributed][${jobId}] ❌ Error:`, err.message);
+
+    // Identify which part failed for clear error reporting
+    const failedPart = jobs[jobId]?.parts?.find(p => p.status === "error");
+    const errorMsg   = failedPart
+      ? `Part ${failedPart.partIndex + 1} failed on ${failedPart.renderer}: ${err.message}`
+      : err.message;
+
+    cleanupFiles(downloadedParts);
+    updateJob(jobId, { status: "error", error: errorMsg, phase: "error" });
+    scheduleJobEviction(jobId);
+  }
+}
 
 // ================================
 // Render from uploaded panels (background)
@@ -1069,15 +1592,14 @@ async function renderFromProject(req, jobId) {
 
     console.log(`[${RENDERER_NAME}][${jobId}] Starting render — ${panels.length} panels — batch ${batchIndex + 1}/${totalBatches} — panelCount=${panelCount}`);
 
-    // CHANGE 5: Use createSegmentSafe with skip support
-    let skipped = 0;
+    // Render each panel sequentially — throws immediately if any panel fails all retries
     for (let i = 0; i < panels.length; i++) {
       const p   = panels[i];
       p.index = i;
       const dur = await calculatePanelDuration(p);
       const segPath = path.join(TEMP_ROOT, `seg_${jobId}_${i}.mp4`);
 
-      const result = await createSegmentSafe({
+      await createSegmentSafe({
         imagePath: path.join(p.dir, p.image),
         audioPath: p.audio ? path.join(p.dir, p.audio) : null,
         text:      p.narration || "",
@@ -1088,23 +1610,15 @@ async function renderFromProject(req, jobId) {
         panelCount
       });
 
-      if (result.success) {
-        segPaths.push(segPath);
-        durations.push(dur);
-      } else {
-        skipped++;
-        console.warn(`[${jobId}] Panel ${i + 1} skipped (${skipped} total skipped)`);
-      }
+      segPaths.push(segPath);
+      durations.push(dur);
 
       const pct = Math.round(((i + 1) / panels.length) * 80);
-      updateJob(jobId, { progress: pct, skipped });
+      updateJob(jobId, { progress: pct });
     }
 
     if (!segPaths.length) {
-      throw new Error("All panels failed to render — no segments produced.");
-    }
-    if (skipped > 0) {
-      console.warn(`[${jobId}] ⚠ ${skipped} panels were skipped due to errors`);
+      throw new Error("No segments produced.");
     }
 
     updateJob(jobId, { progress: 85 });
@@ -1120,7 +1634,6 @@ async function renderFromProject(req, jobId) {
       try { fs.unlinkSync(finalPath); } catch (_) {}
     }, 2 * 60 * 60 * 1000);
 
-    // CHANGE 6: Include rendered + skipped counts in job result
     updateJob(jobId, {
       status: "done",
       progress: 100,
@@ -1131,7 +1644,6 @@ async function renderFromProject(req, jobId) {
       project_id: projectId,
       panels: panels.length,
       rendered: segPaths.length,
-      skipped,
       batchIndex,
       totalBatches,
       renderer: RENDERER_NAME,
@@ -1180,14 +1692,13 @@ async function renderFromMultipart(req, jobId) {
 
     console.log(`[${RENDERER_NAME}][${jobId}] Starting multipart render — ${req.files.length} images — batch ${batchIndex + 1}/${totalBatches} — panelCount=${panelCount}`);
 
-    // CHANGE 5: Use createSegmentSafe with skip support
-    let skipped = 0;
+    // Render each panel sequentially — throws immediately if any panel fails all retries
     for (let i = 0; i < req.files.length; i++) {
       const segPath  = path.join(TEMP_ROOT, `seg_${jobId}_${i}.mp4`);
       const wordCount = String(lines[i] || "").split(/\s+/).filter(Boolean).length;
       const dur = Math.max(3, Math.min(12, Math.round(wordCount / 2.3) + 1));
 
-      const result = await createSegmentSafe({
+      await createSegmentSafe({
         imagePath: req.files[i].path,
         audioPath: null,
         text:      lines[i] || "",
@@ -1198,23 +1709,15 @@ async function renderFromMultipart(req, jobId) {
         panelCount
       });
 
-      if (result.success) {
-        segPaths.push(segPath);
-        durations.push(dur);
-      } else {
-        skipped++;
-        console.warn(`[${jobId}] Panel ${i + 1} skipped (${skipped} total skipped)`);
-      }
+      segPaths.push(segPath);
+      durations.push(dur);
 
       const pct = Math.round(((i + 1) / req.files.length) * 80);
-      updateJob(jobId, { progress: pct, skipped });
+      updateJob(jobId, { progress: pct });
     }
 
     if (!segPaths.length) {
-      throw new Error("All panels failed to render — no segments produced.");
-    }
-    if (skipped > 0) {
-      console.warn(`[${jobId}] ⚠ ${skipped} panels were skipped due to errors`);
+      throw new Error("No segments produced.");
     }
 
     updateJob(jobId, { progress: 85 });
@@ -1230,7 +1733,6 @@ async function renderFromMultipart(req, jobId) {
       try { fs.unlinkSync(finalPath); } catch (_) {}
     }, 2 * 60 * 60 * 1000);
 
-    // CHANGE 6: Include rendered + skipped counts in job result
     updateJob(jobId, {
       status: "done",
       progress: 100,
@@ -1240,7 +1742,6 @@ async function renderFromMultipart(req, jobId) {
       download_url: url,
       panels: req.files.length,
       rendered: segPaths.length,
-      skipped,
       batchIndex,
       totalBatches,
       renderer: RENDERER_NAME,
