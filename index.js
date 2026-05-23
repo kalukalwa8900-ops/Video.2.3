@@ -299,11 +299,12 @@ const diskStorage = multer.diskStorage({
   }
 });
 
+// CHANGE 1: Increased files limit from 400 → 2000
 const diskUpload = multer({
   storage: diskStorage,
   limits: {
     fileSize: 2 * 1024 * 1024,  // 2MB per image
-    files: 400                   // up to 400 images
+    files: 2000                  // up to 2000 images
   }
 });
 
@@ -313,11 +314,23 @@ const zipUpload = multer({
 });
 
 // ================================
+// CHANGE 2: Smart FPS helper by panel count
+// ================================
+
+function getFps(panelCount) {
+  if (panelCount <= 100)  return 20;
+  if (panelCount <= 500)  return 15;
+  if (panelCount <= 1000) return 12;
+  return 10; // 1000–2000 panels
+}
+
+// ================================
 // Ken Burns Animation Presets
 // ================================
 
 function getKenBurnsFilter(idx, duration, panelCount = 1) {
-  const fps = panelCount > 100 ? 12 : 20;
+  // CHANGE 2: Use getFps() helper instead of inline ternary
+  const fps = getFps(panelCount);
   const totalFrames = Math.ceil(duration * fps);
 
   const PRE = "scale=1920:-1";
@@ -385,8 +398,8 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
         .inputOptions(["-f lavfi"]);
     }
 
-    // Derive fps from panelCount to match getKenBurnsFilter
-    const fps = panelCount > 100 ? 12 : 20;
+    // CHANGE 2: Use getFps() helper for consistent FPS
+    const fps = getFps(panelCount);
 
     cmd
       .outputOptions([
@@ -428,6 +441,37 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
       })
       .run();
   });
+}
+
+// ================================
+// CHANGE 3: createSegment with retry + skip on failure
+// ================================
+
+async function createSegmentSafe({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount }) {
+  const MAX_RETRIES = 2;
+  let lastErr;
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      await createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount });
+      return { success: true };
+    } catch (err) {
+      lastErr = err;
+      const isOOM = err.message.includes("Cannot allocate memory") ||
+                    err.message.includes("Out of memory") ||
+                    err.message.includes("ENOMEM") ||
+                    err.message.includes("killed");
+      console.warn(`[seg${idx}] attempt ${attempt}/${MAX_RETRIES} failed${isOOM ? " (OOM)" : ""}: ${err.message.split("\n")[0]}`);
+      if (isOOM) {
+        // Wait before retry to let memory recover
+        await new Promise(r => setTimeout(r, 3000 * attempt));
+      }
+    }
+  }
+
+  // All retries failed — log and return failure so caller can skip
+  console.error(`[seg${idx}] ❌ ALL RETRIES FAILED — skipping panel. Last error: ${lastErr.message.split("\n")[0]}`);
+  return { success: false, error: lastErr.message };
 }
 
 // ================================
@@ -478,8 +522,10 @@ function spawnFfmpeg(args, description = "") {
 }
 
 // ================================
-// CONCAT WITH TRANSITIONS
+// CHANGE 4: CONCAT WITH TRANSITIONS — batch + recursive merge
 // ================================
+
+const BATCH_SIZE = 50; // max clips per FFmpeg process
 
 async function concatWithTransitions(segPaths, durations, outPath) {
   const n = segPaths.length;
@@ -500,17 +546,71 @@ async function concatWithTransitions(segPaths, durations, outPath) {
     }
   }
 
-  const USE_XFADE = n <= 30;
-  console.log(`[concat] strategy=${USE_XFADE ? "xfade" : "simple-concat (>30 clips)"}`);
-
-  if (USE_XFADE) {
-    await concatWithXfade(segPaths, durations, outPath);
+  if (n <= BATCH_SIZE) {
+    // Small enough — use xfade or simple directly
+    const USE_XFADE = n <= 30;
+    console.log(`[concat] strategy=${USE_XFADE ? "xfade" : "simple-concat"} (${n} clips)`);
+    if (USE_XFADE) {
+      await concatWithXfade(segPaths, durations, outPath);
+    } else {
+      await concatSimple(segPaths, outPath);
+    }
   } else {
-    await concatSimple(segPaths, outPath);
+    // Large — batch merge then recursive merge
+    await batchMerge(segPaths, durations, outPath);
   }
 
   const memAfterMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
   console.log(`[concat] END — mem=${memAfterMB}MB → ${outPath}`);
+}
+
+// ================================
+// CHANGE 4a: Batch merge — split into BATCH_SIZE chunks, merge each, then recurse
+// ================================
+
+async function batchMerge(segPaths, durations, outPath) {
+  const n = segPaths.length;
+  const batchCount = Math.ceil(n / BATCH_SIZE);
+  console.log(`[batchMerge] ${n} clips → ${batchCount} batches of ≤${BATCH_SIZE}`);
+
+  const batchOutputs = [];
+  const batchDurations = [];
+  const tempFiles = [];
+
+  for (let b = 0; b < batchCount; b++) {
+    const start = b * BATCH_SIZE;
+    const end   = Math.min(start + BATCH_SIZE, n);
+    const batchSegs = segPaths.slice(start, end);
+    const batchDurs = durations.slice(start, end);
+    const batchOut  = path.join(TEMP_ROOT, `batch_${Date.now()}_${b}.mp4`);
+
+    console.log(`[batchMerge] batch ${b + 1}/${batchCount}: clips ${start + 1}–${end}`);
+
+    const USE_XFADE = batchSegs.length <= 30;
+    if (USE_XFADE) {
+      await concatWithXfade(batchSegs, batchDurs, batchOut);
+    } else {
+      await concatSimple(batchSegs, batchOut);
+    }
+
+    batchOutputs.push(batchOut);
+    tempFiles.push(batchOut);
+
+    // Sum duration for this batch (used for xfade offsets in next level)
+    const totalDur = batchDurs.reduce((a, v) => a + v, 0);
+    batchDurations.push(totalDur);
+
+    const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
+    console.log(`[batchMerge] batch ${b + 1} done — mem=${memMB}MB`);
+  }
+
+  // Recursively merge the batch outputs
+  console.log(`[batchMerge] Merging ${batchOutputs.length} batch files → final`);
+  try {
+    await concatWithTransitions(batchOutputs, batchDurations, outPath);
+  } finally {
+    cleanupFiles(tempFiles);
+  }
 }
 
 // ================================
@@ -871,7 +971,7 @@ app.post("/render", (req, res) => {
     return;
   }
 
-  diskUpload.array("images", 400)(req, res, (multerErr) => {
+  diskUpload.array("images", 2000)(req, res, (multerErr) => {
     if (multerErr) {
       console.error("[/render] Multer error:", multerErr.message);
       return res.status(400).json({ success: false, error: multerErr.message });
@@ -969,13 +1069,15 @@ async function renderFromProject(req, jobId) {
 
     console.log(`[${RENDERER_NAME}][${jobId}] Starting render — ${panels.length} panels — batch ${batchIndex + 1}/${totalBatches} — panelCount=${panelCount}`);
 
+    // CHANGE 5: Use createSegmentSafe with skip support
+    let skipped = 0;
     for (let i = 0; i < panels.length; i++) {
       const p   = panels[i];
       p.index = i;
       const dur = await calculatePanelDuration(p);
       const segPath = path.join(TEMP_ROOT, `seg_${jobId}_${i}.mp4`);
 
-      await createSegment({
+      const result = await createSegmentSafe({
         imagePath: path.join(p.dir, p.image),
         audioPath: p.audio ? path.join(p.dir, p.audio) : null,
         text:      p.narration || "",
@@ -986,11 +1088,23 @@ async function renderFromProject(req, jobId) {
         panelCount
       });
 
-      segPaths.push(segPath);
-      durations.push(dur);
+      if (result.success) {
+        segPaths.push(segPath);
+        durations.push(dur);
+      } else {
+        skipped++;
+        console.warn(`[${jobId}] Panel ${i + 1} skipped (${skipped} total skipped)`);
+      }
 
       const pct = Math.round(((i + 1) / panels.length) * 80);
-      updateJob(jobId, { progress: pct });
+      updateJob(jobId, { progress: pct, skipped });
+    }
+
+    if (!segPaths.length) {
+      throw new Error("All panels failed to render — no segments produced.");
+    }
+    if (skipped > 0) {
+      console.warn(`[${jobId}] ⚠ ${skipped} panels were skipped due to errors`);
     }
 
     updateJob(jobId, { progress: 85 });
@@ -1006,6 +1120,7 @@ async function renderFromProject(req, jobId) {
       try { fs.unlinkSync(finalPath); } catch (_) {}
     }, 2 * 60 * 60 * 1000);
 
+    // CHANGE 6: Include rendered + skipped counts in job result
     updateJob(jobId, {
       status: "done",
       progress: 100,
@@ -1015,6 +1130,8 @@ async function renderFromProject(req, jobId) {
       download_url: url,
       project_id: projectId,
       panels: panels.length,
+      rendered: segPaths.length,
+      skipped,
       batchIndex,
       totalBatches,
       renderer: RENDERER_NAME,
@@ -1063,12 +1180,14 @@ async function renderFromMultipart(req, jobId) {
 
     console.log(`[${RENDERER_NAME}][${jobId}] Starting multipart render — ${req.files.length} images — batch ${batchIndex + 1}/${totalBatches} — panelCount=${panelCount}`);
 
+    // CHANGE 5: Use createSegmentSafe with skip support
+    let skipped = 0;
     for (let i = 0; i < req.files.length; i++) {
       const segPath  = path.join(TEMP_ROOT, `seg_${jobId}_${i}.mp4`);
       const wordCount = String(lines[i] || "").split(/\s+/).filter(Boolean).length;
       const dur = Math.max(3, Math.min(12, Math.round(wordCount / 2.3) + 1));
 
-      await createSegment({
+      const result = await createSegmentSafe({
         imagePath: req.files[i].path,
         audioPath: null,
         text:      lines[i] || "",
@@ -1079,11 +1198,23 @@ async function renderFromMultipart(req, jobId) {
         panelCount
       });
 
-      segPaths.push(segPath);
-      durations.push(dur);
+      if (result.success) {
+        segPaths.push(segPath);
+        durations.push(dur);
+      } else {
+        skipped++;
+        console.warn(`[${jobId}] Panel ${i + 1} skipped (${skipped} total skipped)`);
+      }
 
       const pct = Math.round(((i + 1) / req.files.length) * 80);
-      updateJob(jobId, { progress: pct });
+      updateJob(jobId, { progress: pct, skipped });
+    }
+
+    if (!segPaths.length) {
+      throw new Error("All panels failed to render — no segments produced.");
+    }
+    if (skipped > 0) {
+      console.warn(`[${jobId}] ⚠ ${skipped} panels were skipped due to errors`);
     }
 
     updateJob(jobId, { progress: 85 });
@@ -1099,6 +1230,7 @@ async function renderFromMultipart(req, jobId) {
       try { fs.unlinkSync(finalPath); } catch (_) {}
     }, 2 * 60 * 60 * 1000);
 
+    // CHANGE 6: Include rendered + skipped counts in job result
     updateJob(jobId, {
       status: "done",
       progress: 100,
@@ -1107,6 +1239,8 @@ async function renderFromMultipart(req, jobId) {
       video_url: url,
       download_url: url,
       panels: req.files.length,
+      rendered: segPaths.length,
+      skipped,
       batchIndex,
       totalBatches,
       renderer: RENDERER_NAME,
