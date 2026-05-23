@@ -224,8 +224,8 @@ function getAudioDuration(audioPath) {
 async function calculatePanelDuration(panel) {
   const PADDING = 0.2;
 
-  // Priority 1: Any uploaded audio (zip or panel-direct) — probe for actual duration
-  if (panel.audio && (panel.audio_source === "zip" || panel.audio_source === "panel")) {
+  // Priority 1: ZIP MP3 audio (actual duration)
+  if (panel.audio && panel.audio_source === "zip") {
     const audioPath = path.join(panel.dir, panel.audio);
     const result = await getAudioDuration(audioPath);
     if (result.valid) {
@@ -393,21 +393,6 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
       "setsar=1"
     ];
 
-    // Apply subtitle overlay if there is narration text and the font exists
-    if (wrapped && fs.existsSync(FONT)) {
-      // Escape special drawtext characters: \, ', :
-      const escaped = wrapped
-        .replace(/\\/g, "\\\\")
-        .replace(/'/g, "\u2019")
-        .replace(/:/g, "\\:");
-      vfParts.push(
-        `drawtext=fontfile='${FONT}':text='${escaped}':fontcolor=white:fontsize=28` +
-        `:borderw=2:bordercolor=black@0.8` +
-        `:x=(w-text_w)/2:y=h-th-40` +
-        `:line_spacing=6`
-      );
-    }
-
     const hasAudio = audioPath && fs.existsSync(audioPath);
 
     const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
@@ -483,14 +468,6 @@ async function createSegmentSafe({ imagePath, audioPath, text, duration, outPath
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
       await createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount });
-
-      // Validate the produced segment has both video and audio streams before proceeding.
-      // Catches silent FFmpeg failures where the process exits 0 but output is corrupt.
-      const check = await validateSegment(outPath);
-      if (!check.valid) {
-        throw new Error(`Segment validation failed: ${check.reason}`);
-      }
-
       return;
     } catch (err) {
       lastErr = err;
@@ -868,13 +845,11 @@ app.post(
 
       let audioPath = null;
       let audioFileName = null;
-      let audioSource = null;
       if (req.files?.audio && req.files.audio[0]) {
         const audioExt = extFor(req.files.audio[0], ".mp3");
         audioFileName = `audio${audioExt}`;
         audioPath = path.join(panelDir, audioFileName);
         fs.writeFileSync(audioPath, req.files.audio[0].buffer);
-        audioSource = "panel";  // marks audio as uploaded directly (enables ffprobe duration)
       }
 
       const index = Number(req.body.index || 0);
@@ -885,10 +860,9 @@ app.post(
           index,
           duration,
           narration,
-          image:        "image.jpg",
-          audio:        audioFileName,
-          audio_source: audioSource,
-          uploaded_at:  new Date().toISOString()
+          image:       "image.jpg",
+          audio:       audioFileName,
+          uploaded_at: new Date().toISOString()
         }, null, 2)
       );
 
@@ -1117,33 +1091,6 @@ app.post("/render", (req, res) => {
 // Distributed Render Helpers
 // ================================
 
-// node-fetch v2's { timeout } option only covers the connection phase, not slow
-// response bodies. This wrapper enforces a hard wall-clock deadline that aborts
-// the entire request — including a stalled download body.
-//
-// AbortController is built-in from Node 16+. On Node 14 it is not available
-// globally, so we fall back to a Promise.race timeout that at minimum surfaces
-// a clear timeout error rather than hanging forever.
-function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
-  const AbortCtrl = typeof AbortController !== "undefined" ? AbortController : null;
-
-  if (AbortCtrl) {
-    // Node 16+ path: true abort — tears down the socket immediately on timeout
-    const controller = new AbortCtrl();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    return fetch(url, { ...options, signal: controller.signal })
-      .finally(() => clearTimeout(timer));
-  }
-
-  // Node 14 fallback: race the fetch against a rejection timer.
-  // The fetch will still run to completion in the background, but callers
-  // receive the timeout error promptly and can move on / retry.
-  const timeoutPromise = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error(`Request timed out after ${timeoutMs}ms: ${url}`)), timeoutMs)
-  );
-  return Promise.race([fetch(url, options), timeoutPromise]);
-}
-
 // Split an array into N roughly-equal chunks
 function splitIntoChunks(arr, n) {
   const chunks = [];
@@ -1207,7 +1154,7 @@ async function pollRemoteStatus(rendererUrl, remoteJobId, masterJobId, partIndex
     await new Promise(r => setTimeout(r, POLL_INTERVAL));
 
     try {
-      const res = await fetchWithTimeout(`${rendererUrl}/status/${remoteJobId}`, {}, 15000);
+      const res = await fetch(`${rendererUrl}/status/${remoteJobId}`, { timeout: 15000 });
 
       if (!res.ok) {
         console.warn(`[distributed][part${partIndex + 1}] Poll HTTP ${res.status} — retrying`);
@@ -1244,7 +1191,7 @@ async function pollRemoteStatus(rendererUrl, remoteJobId, masterJobId, partIndex
 // Download a remote MP4 to a local temp path
 async function downloadPartVideo(url, destPath, partIndex) {
   console.log(`[distributed][part${partIndex + 1}] Downloading ${url} → ${destPath}`);
-  const res = await fetchWithTimeout(url, {}, 10 * 60 * 1000);
+  const res = await fetch(url, { timeout: 10 * 60 * 1000 });
   if (!res.ok) throw new Error(`Failed to download part ${partIndex + 1}: HTTP ${res.status}`);
 
   const buffer = await res.buffer();
@@ -1262,11 +1209,12 @@ async function sendChunkToRenderer(rendererUrl, zipBuffer, partIndex) {
     contentType: "application/zip"
   });
 
-  const res = await fetchWithTimeout(`${rendererUrl}/render-chunk-zip`, {
+  const res = await fetch(`${rendererUrl}/render-chunk-zip`, {
     method:  "POST",
     body:    form,
-    headers: form.getHeaders()
-  }, 5 * 60 * 1000);  // 5 min upload timeout
+    headers: form.getHeaders(),
+    timeout: 5 * 60 * 1000  // 5 min upload timeout
+  });
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -1405,9 +1353,8 @@ async function runDistributedRender(jobId, projectId, chunks, req) {
 
         const remoteJobId = await sendChunkToRenderer(RENDERER_URLS[i], zipBuffer, i);
 
-        // Drop reference so GC can reclaim the ZIP buffer memory on the next cycle.
-        // Do NOT call fill(0) here — on 300–500MB ZIPs it causes a full buffer
-        // rewrite that spikes CPU and RAM pressure with no security benefit.
+        // Zero and release the buffer before building the next ZIP
+        zipBuffer.fill(0);
 
         jobs[jobId].parts[i].status      = "rendering";
         jobs[jobId].parts[i].remoteJobId = remoteJobId;
