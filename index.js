@@ -328,12 +328,26 @@ function getFps(panelCount) {
 // Ken Burns Animation Presets
 // ================================
 
-function getKenBurnsFilter(idx, duration, panelCount = 1) {
+function getKenBurnsFilter(idx, duration, panelCount = 1, aspectMode = "fill") {
   // CHANGE 2: Use getFps() helper instead of inline ternary
   const fps = getFps(panelCount);
   const totalFrames = Math.ceil(duration * fps);
 
-  const PRE = "scale=1920:-1";
+  // ── Aspect-ratio aware pre-scale ──────────────────────────────────────────
+  // "fill"  → crop/fill entire 1280×720 frame (original behaviour)
+  // "keep"  → letterbox/pillarbox: scale down to fit, pad remainder with black
+  // "9:16"  → same as "keep" — portrait images get black bars on left/right
+  // Any unknown value → fall back to "keep" (safe default, no distortion)
+  let PRE;
+  const normalised = String(aspectMode || "fill").toLowerCase().trim();
+  if (normalised === "fill") {
+    // Scale so the shorter side fills 1280×720, then crop to exact frame
+    PRE = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720";
+  } else {
+    // keep / 9:16 / anything else → scale to fit inside 1280×720, pad with black
+    PRE = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black";
+  }
+  // ─────────────────────────────────────────────────────────────────────────
 
   const zoomInStep  = "0.0019";
   const zoomOutStart = "1.5";
@@ -368,12 +382,12 @@ function getKenBurnsFilter(idx, duration, panelCount = 1) {
 // Create Segment (MP4)
 // ================================
 
-function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount }) {
+function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount, aspectMode }) {
   return new Promise((resolve, reject) => {
 
     const FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
     const wrapped = wrapText(text);
-    const kenBurns = getKenBurnsFilter(idx, duration, panelCount);
+    const kenBurns = getKenBurnsFilter(idx, duration, panelCount, aspectMode);
 
     const vfParts = [
       kenBurns,
@@ -447,13 +461,13 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
 // CHANGE 3: createSegment with retry + skip on failure
 // ================================
 
-async function createSegmentSafe({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount }) {
+async function createSegmentSafe({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount, aspectMode }) {
   const MAX_RETRIES = 2;
   let lastErr;
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      await createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount });
+      await createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount, aspectMode });
       return { success: true };
     } catch (err) {
       lastErr = err;
@@ -1057,6 +1071,7 @@ async function renderFromProject(req, jobId) {
   const batchIndex   = Number(req.body.batchIndex   || req.body.batch_index   || 0);
   const totalBatches = Number(req.body.totalBatches || req.body.total_batches || 1);
   const panelCount   = panels.length;
+  const aspectMode   = String(req.body.aspectMode || req.body.aspect_mode || "fill").toLowerCase().trim();
 
   updateJob(jobId, { batchIndex, totalBatches });
 
@@ -1067,7 +1082,7 @@ async function renderFromProject(req, jobId) {
     console.log(`[${RENDERER_NAME}][${jobId}] Starting validation — ${panels.length} panels`);
     await validateRenderPanels(panels);
 
-    console.log(`[${RENDERER_NAME}][${jobId}] Starting render — ${panels.length} panels — batch ${batchIndex + 1}/${totalBatches} — panelCount=${panelCount}`);
+    console.log(`[${RENDERER_NAME}][${jobId}] Starting render — ${panels.length} panels — batch ${batchIndex + 1}/${totalBatches} — panelCount=${panelCount} — aspectMode=${aspectMode}`);
 
     // CHANGE 5: Use createSegmentSafe with skip support
     let skipped = 0;
@@ -1085,7 +1100,8 @@ async function renderFromProject(req, jobId) {
         outPath:   segPath,
         jobId,
         idx: i,
-        panelCount
+        panelCount,
+        aspectMode
       });
 
       if (result.success) {
@@ -1168,6 +1184,7 @@ async function renderFromMultipart(req, jobId) {
   const batchIndex   = Number(req.body.batchIndex   || req.body.batch_index   || 0);
   const totalBatches = Number(req.body.totalBatches || req.body.total_batches || 1);
   const panelCount   = req.files.length;
+  const aspectMode   = String(req.body.aspectMode || req.body.aspect_mode || "fill").toLowerCase().trim();
 
   updateJob(jobId, { batchIndex, totalBatches });
 
@@ -1178,7 +1195,7 @@ async function renderFromMultipart(req, jobId) {
 
     while (lines.length < req.files.length) lines.push("");
 
-    console.log(`[${RENDERER_NAME}][${jobId}] Starting multipart render — ${req.files.length} images — batch ${batchIndex + 1}/${totalBatches} — panelCount=${panelCount}`);
+    console.log(`[${RENDERER_NAME}][${jobId}] Starting multipart render — ${req.files.length} images — batch ${batchIndex + 1}/${totalBatches} — panelCount=${panelCount} — aspectMode=${aspectMode}`);
 
     // CHANGE 5: Use createSegmentSafe with skip support
     let skipped = 0;
@@ -1195,7 +1212,8 @@ async function renderFromMultipart(req, jobId) {
         outPath:   segPath,
         jobId,
         idx: i,
-        panelCount
+        panelCount,
+        aspectMode
       });
 
       if (result.success) {
