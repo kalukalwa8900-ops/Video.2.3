@@ -310,11 +310,12 @@ const diskStorage = multer.diskStorage({
   }
 });
 
+// FIX: Increased fileSize limit from 2MB to 300MB to support larger uploads
 const diskUpload = multer({
   storage: diskStorage,
   limits: {
-    fileSize: 2 * 1024 * 1024,  // 2MB per image
-    files: 2000                  // up to 2000 images
+    fileSize: 300 * 1024 * 1024,  // 300MB per file (was 2MB)
+    files: 3000                    // up to 3000 files
   }
 });
 
@@ -1049,7 +1050,13 @@ app.post("/render", (req, res) => {
     return;
   }
 
-  diskUpload.array("images", 2000)(req, res, (multerErr) => {
+  // FIX: Change from .array() to .fields() to support overlay, watermark, etc.
+  diskUpload.fields([
+    { name: "images", maxCount: 2000 },
+    { name: "overlay", maxCount: 1 },
+    { name: "overlayLogo", maxCount: 1 },
+    { name: "watermark", maxCount: 1 }
+  ])(req, res, (multerErr) => {
     if (multerErr) {
       console.error("[/render] Multer error:", multerErr.message);
       return res.status(400).json({ success: false, error: multerErr.message });
@@ -1175,7 +1182,7 @@ async function renderFromProject(req, jobId) {
     console.log(`[${RENDERER_NAME}][${jobId}] Starting validation — ${panels.length} panels`);
     await validateRenderPanels(panels);
 
-    console.log(`[${RENDERER_NAME}][${jobId}] Starting render — ${panels.length} panels — batch ${batchIndex + 1}/${totalBatches} — panelCount=${panelCount} — renderOptions=${JSON.stringify(renderOptions)}`);
+    console.log(`[${RENDERER_NAME}][${jobId}] Starting render — ${panels.length} panels — batch ${batchIndex + 1}/${totalBatches} — panelCount=${panelCount}`);
 
     let skipped = 0;
     for (let i = 0; i < panels.length; i++) {
@@ -1269,9 +1276,12 @@ async function renderFromProject(req, jobId) {
 async function renderFromMultipart(req, jobId) {
   const segPaths    = [];
   const durations   = [];
-  const uploadPaths = (req.files || []).map((f) => f.path);
+  
+  // FIX: Use req.files.images array instead of req.files (because .fields() changes structure)
+  const imageFiles = req.files.images || [];
+  const uploadPaths = imageFiles.map((f) => f.path);
 
-  if (!req.files?.length) {
+  if (!imageFiles?.length) {
     return updateJob(jobId, { status: "error", error: "No images uploaded." });
   }
 
@@ -1279,7 +1289,7 @@ async function renderFromMultipart(req, jobId) {
 
   const batchIndex   = Number(req.body.batchIndex   || req.body.batch_index   || 0);
   const totalBatches = Number(req.body.totalBatches || req.body.total_batches || 1);
-  const panelCount   = req.files.length;
+  const panelCount   = imageFiles.length;
   const renderOptions = extractRenderOptions(req.body);
 
   updateJob(jobId, { batchIndex, totalBatches });
@@ -1289,18 +1299,18 @@ async function renderFromMultipart(req, jobId) {
       .split("\n")
       .map((l) => l.trim());
 
-    while (lines.length < req.files.length) lines.push("");
+    while (lines.length < imageFiles.length) lines.push("");
 
-    console.log(`[${RENDERER_NAME}][${jobId}] Starting multipart render — ${req.files.length} images — batch ${batchIndex + 1}/${totalBatches} — panelCount=${panelCount} — renderOptions=${JSON.stringify(renderOptions)}`);
+    console.log(`[${RENDERER_NAME}][${jobId}] Starting multipart render — ${imageFiles.length} images — batch ${batchIndex + 1}/${totalBatches}`);
 
     let skipped = 0;
-    for (let i = 0; i < req.files.length; i++) {
+    for (let i = 0; i < imageFiles.length; i++) {
       const segPath  = path.join(TEMP_ROOT, `seg_${jobId}_${i}.mp4`);
       const wordCount = String(lines[i] || "").split(/\s+/).filter(Boolean).length;
       const dur = Math.max(3, Math.min(12, Math.round(wordCount / 2.3) + 1));
 
       const result = await createSegmentSafe({
-        imagePath: req.files[i].path,
+        imagePath: imageFiles[i].path,
         audioPath: null,
         text:      lines[i] || "",
         duration:  dur,
@@ -1319,7 +1329,7 @@ async function renderFromMultipart(req, jobId) {
         console.warn(`[${jobId}] Panel ${i + 1} skipped (${skipped} total skipped)`);
       }
 
-      const pct = Math.round(((i + 1) / req.files.length) * 80);
+      const pct = Math.round(((i + 1) / imageFiles.length) * 80);
       updateJob(jobId, { progress: pct, skipped });
     }
 
@@ -1350,7 +1360,7 @@ async function renderFromMultipart(req, jobId) {
       videoUrl: url,
       video_url: url,
       download_url: url,
-      panels: req.files.length,
+      panels: imageFiles.length,
       rendered: segPaths.length,
       skipped,
       batchIndex,
