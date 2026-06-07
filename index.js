@@ -299,7 +299,6 @@ const diskStorage = multer.diskStorage({
   }
 });
 
-// CHANGE 1: Increased files limit from 400 → 2000
 const diskUpload = multer({
   storage: diskStorage,
   limits: {
@@ -314,7 +313,7 @@ const zipUpload = multer({
 });
 
 // ================================
-// CHANGE 2: Smart FPS helper by panel count
+// Smart FPS helper by panel count
 // ================================
 
 function getFps(panelCount) {
@@ -329,25 +328,16 @@ function getFps(panelCount) {
 // ================================
 
 function getKenBurnsFilter(idx, duration, panelCount = 1, aspectMode = "fill") {
-  // CHANGE 2: Use getFps() helper instead of inline ternary
   const fps = getFps(panelCount);
   const totalFrames = Math.ceil(duration * fps);
 
-  // ── Aspect-ratio aware pre-scale ──────────────────────────────────────────
-  // "fill"  → crop/fill entire 1280×720 frame (original behaviour)
-  // "keep"  → letterbox/pillarbox: scale down to fit, pad remainder with black
-  // "9:16"  → same as "keep" — portrait images get black bars on left/right
-  // Any unknown value → fall back to "keep" (safe default, no distortion)
   let PRE;
   const normalised = String(aspectMode || "fill").toLowerCase().trim();
   if (normalised === "fill") {
-    // Scale so the shorter side fills 1280×720, then crop to exact frame
     PRE = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720";
   } else {
-    // keep / 9:16 / anything else → scale to fit inside 1280×720, pad with black
     PRE = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black";
   }
-  // ─────────────────────────────────────────────────────────────────────────
 
   const zoomInStep  = "0.0019";
   const zoomOutStart = "1.5";
@@ -356,22 +346,11 @@ function getKenBurnsFilter(idx, duration, panelCount = 1, aspectMode = "fill") {
   const diagSpeed   = "1.8";
 
   const animations = [
-    // 0: Slow zoom in from center
     `${PRE},zoompan=z='min(zoom+${zoomInStep},1.5)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=${fps}`,
-
-    // 1: Slow zoom out to center
     `${PRE},zoompan=z='if(lte(zoom,1.0),${zoomOutStart},max(zoom-${zoomOutStep},1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=${fps}`,
-
-    // 2: Pan left to right with slight zoom
     `${PRE},zoompan=z='1.3':x='if(lte(on,1),0,min(x+${panSpeed},iw/zoom))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=${fps}`,
-
-    // 3: Pan right to left with slight zoom
     `${PRE},zoompan=z='1.3':x='if(lte(on,1),iw/zoom,max(x-${panSpeed},0))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=${fps}`,
-
-    // 4: Slide up (pan bottom to top)
     `${PRE},zoompan=z='1.3':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih/zoom,max(y-${diagSpeed},0))':d=${totalFrames}:s=1280x720:fps=${fps}`,
-
-    // 5: Slide down (pan top to bottom)
     `${PRE},zoompan=z='1.3':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),0,min(y+${diagSpeed},ih/zoom))':d=${totalFrames}:s=1280x720:fps=${fps}`,
   ];
 
@@ -379,18 +358,52 @@ function getKenBurnsFilter(idx, duration, panelCount = 1, aspectMode = "fill") {
 }
 
 // ================================
-// Create Segment (MP4)
+// ENHANCEMENT 1: Build FFmpeg audio filter chain
 // ================================
 
-function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount, aspectMode }) {
-  return new Promise((resolve, reject) => {
+function buildAudioFilterChain(options = {}) {
+  const filters = [];
+  if (options.audioNormalize || options.loudnorm) {
+    filters.push("loudnorm=I=-16:TP=-1.5:LRA=11");
+  }
+  return filters.length ? filters.join(",") : "";
+}
 
+// ================================
+// ENHANCEMENT 2: Build FFmpeg video filter chain
+// ================================
+
+function buildVideoFilterChain(options = {}, baseFilter = "") {
+  const filters = [baseFilter];
+  if (options.zoom || options.zoomFactor || options.cropX || options.cropY) {
+    const zoomFactor = parseFloat(options.zoomFactor || options.zoom || 1.0);
+    if (zoomFactor > 1.0 && zoomFactor <= 3.0) {
+      const centerX = Math.max(0, parseFloat(options.focusX || 0.5) * 1280);
+      const centerY = Math.max(0, parseFloat(options.focusY || 0.5) * 720);
+      filters.push(`zoom=z=${zoomFactor}:x='${centerX}':y='${centerY}'`);
+    } else if (options.cropX || options.cropY) {
+      const w = Math.max(100, parseInt(options.cropX) || 1280);
+      const h = Math.max(100, parseInt(options.cropY) || 720);
+      const cx = Math.max(0, Math.min(1280 - w, 1280 / 2 - w / 2));
+      const cy = Math.max(0, Math.min(720 - h, 720 / 2 - h / 2));
+      filters.push(`crop=${w}:${h}:${cx}:${cy},scale=1280:720`);
+    }
+  }
+  return filters.join(",");
+}
+
+// ================================
+// Create Segment (MP4) with new payload fields
+// ================================
+
+function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount, aspectMode, renderOptions = {} }) {
+  return new Promise((resolve, reject) => {
     const FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
     const wrapped = wrapText(text);
     const kenBurns = getKenBurnsFilter(idx, duration, panelCount, aspectMode);
-
+    
     const vfParts = [
-      kenBurns,
+      buildVideoFilterChain(renderOptions, kenBurns),
       "setsar=1"
     ];
 
@@ -412,22 +425,44 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
         .inputOptions(["-f lavfi"]);
     }
 
-    // CHANGE 2: Use getFps() helper for consistent FPS
     const fps = getFps(panelCount);
 
+    // Extract encoding options from payload (with safe defaults)
+    const videoCodec = renderOptions.videoCodec || "libx264";
+    const pixFmt = renderOptions.pixFmt || "yuv420p";
+    const crf = Math.max(18, Math.min(51, parseInt(renderOptions.crf) || 26));
+    const preset = renderOptions.preset || "ultrafast";
+    const maxrate = renderOptions.maxrate || "";
+    const bufsize = renderOptions.bufsize || "";
+    const audioBitrate = renderOptions.audioBitrate || "128k";
+    const movflags = renderOptions.movflags ? String(renderOptions.movflags) : "+faststart";
+
+    const outputOpts = [
+      `-vf ${vfParts.join(",")}`,
+      `-c:v ${videoCodec}`,
+      `-pix_fmt ${pixFmt}`,
+      `-r ${fps}`,
+      `-crf ${crf}`,
+      `-preset ${preset}`,
+      `-movflags ${movflags}`,
+      `-c:a aac`,
+      `-b:a ${audioBitrate}`,
+      "-shortest",
+      `-t ${duration}`
+    ];
+
+    // Add bitrate control if specified
+    if (maxrate) outputOpts.splice(-3, 0, `-maxrate ${maxrate}`);
+    if (bufsize) outputOpts.splice(-3, 0, `-bufsize ${bufsize}`);
+
+    // Add audio normalization filter if requested
+    const audioFilter = buildAudioFilterChain(renderOptions);
+    if (audioFilter) {
+      outputOpts.splice(0, 0, `-af ${audioFilter}`);
+    }
+
     cmd
-      .outputOptions([
-        `-vf ${vfParts.join(",")}`,
-        "-c:v libx264",
-        "-pix_fmt yuv420p",
-        `-r ${fps}`,
-        "-preset ultrafast",
-        "-movflags +faststart",
-        "-c:a aac",
-        "-b:a 128k",
-        "-shortest",
-        `-t ${duration}`
-      ])
+      .outputOptions(outputOpts)
       .output(outPath)
       .on("start", (cmd) => {
         console.log(`[seg${idx}] FFmpeg started`);
@@ -458,16 +493,16 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
 }
 
 // ================================
-// CHANGE 3: createSegment with retry + skip on failure
+// createSegment with retry + skip on failure
 // ================================
 
-async function createSegmentSafe({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount, aspectMode }) {
+async function createSegmentSafe({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount, aspectMode, renderOptions = {} }) {
   const MAX_RETRIES = 2;
   let lastErr;
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      await createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount, aspectMode });
+      await createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount, aspectMode, renderOptions });
       return { success: true };
     } catch (err) {
       lastErr = err;
@@ -477,13 +512,11 @@ async function createSegmentSafe({ imagePath, audioPath, text, duration, outPath
                     err.message.includes("killed");
       console.warn(`[seg${idx}] attempt ${attempt}/${MAX_RETRIES} failed${isOOM ? " (OOM)" : ""}: ${err.message.split("\n")[0]}`);
       if (isOOM) {
-        // Wait before retry to let memory recover
         await new Promise(r => setTimeout(r, 3000 * attempt));
       }
     }
   }
 
-  // All retries failed — log and return failure so caller can skip
   console.error(`[seg${idx}] ❌ ALL RETRIES FAILED — skipping panel. Last error: ${lastErr.message.split("\n")[0]}`);
   return { success: false, error: lastErr.message };
 }
@@ -536,12 +569,12 @@ function spawnFfmpeg(args, description = "") {
 }
 
 // ================================
-// CHANGE 4: CONCAT WITH TRANSITIONS — batch + recursive merge
+// CONCAT WITH TRANSITIONS — batch + recursive merge
 // ================================
 
-const BATCH_SIZE = 50; // max clips per FFmpeg process
+const BATCH_SIZE = 50;
 
-async function concatWithTransitions(segPaths, durations, outPath) {
+async function concatWithTransitions(segPaths, durations, outPath, renderOptions = {}) {
   const n = segPaths.length;
   const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
   console.log(`\n[concat] START — ${n} segments — mem=${memMB}MB`);
@@ -561,17 +594,15 @@ async function concatWithTransitions(segPaths, durations, outPath) {
   }
 
   if (n <= BATCH_SIZE) {
-    // Small enough — use xfade or simple directly
     const USE_XFADE = n <= 30;
     console.log(`[concat] strategy=${USE_XFADE ? "xfade" : "simple-concat"} (${n} clips)`);
     if (USE_XFADE) {
-      await concatWithXfade(segPaths, durations, outPath);
+      await concatWithXfade(segPaths, durations, outPath, renderOptions);
     } else {
-      await concatSimple(segPaths, outPath);
+      await concatSimple(segPaths, outPath, renderOptions);
     }
   } else {
-    // Large — batch merge then recursive merge
-    await batchMerge(segPaths, durations, outPath);
+    await batchMerge(segPaths, durations, outPath, renderOptions);
   }
 
   const memAfterMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
@@ -579,10 +610,10 @@ async function concatWithTransitions(segPaths, durations, outPath) {
 }
 
 // ================================
-// CHANGE 4a: Batch merge — split into BATCH_SIZE chunks, merge each, then recurse
+// Batch merge — split into BATCH_SIZE chunks, merge each, then recurse
 // ================================
 
-async function batchMerge(segPaths, durations, outPath) {
+async function batchMerge(segPaths, durations, outPath, renderOptions = {}) {
   const n = segPaths.length;
   const batchCount = Math.ceil(n / BATCH_SIZE);
   console.log(`[batchMerge] ${n} clips → ${batchCount} batches of ≤${BATCH_SIZE}`);
@@ -602,15 +633,14 @@ async function batchMerge(segPaths, durations, outPath) {
 
     const USE_XFADE = batchSegs.length <= 30;
     if (USE_XFADE) {
-      await concatWithXfade(batchSegs, batchDurs, batchOut);
+      await concatWithXfade(batchSegs, batchDurs, batchOut, renderOptions);
     } else {
-      await concatSimple(batchSegs, batchOut);
+      await concatSimple(batchSegs, batchOut, renderOptions);
     }
 
     batchOutputs.push(batchOut);
     tempFiles.push(batchOut);
 
-    // Sum duration for this batch (used for xfade offsets in next level)
     const totalDur = batchDurs.reduce((a, v) => a + v, 0);
     batchDurations.push(totalDur);
 
@@ -618,20 +648,19 @@ async function batchMerge(segPaths, durations, outPath) {
     console.log(`[batchMerge] batch ${b + 1} done — mem=${memMB}MB`);
   }
 
-  // Recursively merge the batch outputs
   console.log(`[batchMerge] Merging ${batchOutputs.length} batch files → final`);
   try {
-    await concatWithTransitions(batchOutputs, batchDurations, outPath);
+    await concatWithTransitions(batchOutputs, batchDurations, outPath, renderOptions);
   } finally {
     cleanupFiles(tempFiles);
   }
 }
 
 // ================================
-// xfade concat (≤30 clips)
+// xfade concat (≤30 clips) with render options
 // ================================
 
-async function concatWithXfade(segPaths, durations, outPath) {
+async function concatWithXfade(segPaths, durations, outPath, renderOptions = {}) {
   const TRANSITION_DURATION = 0.5;
   const TRANSITION_TYPE     = "slideright";
 
@@ -657,17 +686,22 @@ async function concatWithXfade(segPaths, durations, outPath) {
   const inputArgs = [];
   for (const seg of segPaths) inputArgs.push("-i", seg);
 
+  const crf = Math.max(18, Math.min(51, parseInt(renderOptions.crf) || 23));
+  const preset = renderOptions.preset || "ultrafast";
+  const pixFmt = renderOptions.pixFmt || "yuv420p";
+  const audioBitrate = renderOptions.audioBitrate || "128k";
+
   const outputArgs = [
     "-filter_complex", filterComplex,
     "-map", "[vout]",
     "-map", "[aout]",
     "-c:v", "libx264",
-    "-pix_fmt", "yuv420p",
-    "-crf", "23",
-    "-preset", "ultrafast",
+    "-pix_fmt", pixFmt,
+    "-crf", String(crf),
+    "-preset", preset,
     "-movflags", "+faststart",
     "-c:a", "aac",
-    "-b:a", "128k",
+    "-b:a", audioBitrate,
     "-y",
     outPath
   ];
@@ -678,30 +712,35 @@ async function concatWithXfade(segPaths, durations, outPath) {
     console.log(`[concat] ✓ xfade succeeded`);
   } catch (xfadeErr) {
     console.warn(`[concat] xfade failed (${xfadeErr.message.split("\n")[0]}) — falling back to simple concat`);
-    await concatSimple(segPaths, outPath);
+    await concatSimple(segPaths, outPath, renderOptions);
   }
 }
 
 // ================================
-// simple concat (>30 clips or fallback)
+// simple concat (>30 clips or fallback) with render options
 // ================================
 
-async function concatSimple(segPaths, outPath) {
+async function concatSimple(segPaths, outPath, renderOptions = {}) {
   console.log(`[concat] Running simple concat (${segPaths.length} clips)...`);
   const concatFile = path.join(TEMP_ROOT, `concat_${Date.now()}.txt`);
   fs.writeFileSync(concatFile, segPaths.map(s => `file '${s}'`).join("\n"), "utf8");
+
+  const crf = Math.max(18, Math.min(51, parseInt(renderOptions.crf) || 23));
+  const preset = renderOptions.preset || "ultrafast";
+  const pixFmt = renderOptions.pixFmt || "yuv420p";
+  const audioBitrate = renderOptions.audioBitrate || "128k";
 
   const args = [
     "-f", "concat",
     "-safe", "0",
     "-i", concatFile,
     "-c:v", "libx264",
-    "-pix_fmt", "yuv420p",
-    "-crf", "23",
-    "-preset", "ultrafast",
+    "-pix_fmt", pixFmt,
+    "-crf", String(crf),
+    "-preset", preset,
     "-movflags", "+faststart",
     "-c:a", "aac",
-    "-b:a", "128k",
+    "-b:a", audioBitrate,
     "-y",
     outPath
   ];
@@ -725,7 +764,6 @@ async function validateRenderPanels(panels) {
     const p = panels[i];
     const panelNum = i + 1;
 
-    // Check image exists
     if (!p.image || !fs.existsSync(path.join(p.dir, p.image))) {
       errors.push(`Panel ${panelNum} image missing`);
       continue;
@@ -733,7 +771,6 @@ async function validateRenderPanels(panels) {
 
     console.log(`[validate] ✓ Panel ${panelNum} image valid`);
 
-    // Check audio exists and is valid (if audio is specified)
     if (p.audio) {
       const audioPath = path.join(p.dir, p.audio);
       if (!fs.existsSync(audioPath)) {
@@ -1005,6 +1042,35 @@ app.post("/render", (req, res) => {
 });
 
 // ================================
+// ENHANCEMENT 3: Extract render options from payload
+// ================================
+
+function extractRenderOptions(body) {
+  return {
+    audioNormalize: body.audioNormalize === true || body.audioNormalize === "true",
+    loudnorm: body.loudnorm === true || body.loudnorm === "true",
+    crf: body.crf || 26,
+    preset: body.preset || "ultrafast",
+    maxrate: body.maxrate || "",
+    bufsize: body.bufsize || "",
+    audioBitrate: body.audioBitrate || "128k",
+    movflags: body.movflags || "+faststart",
+    pixFmt: body.pixFmt || "yuv420p",
+    videoCodec: body.videoCodec || "libx264",
+    overlay: body.overlay === true || body.overlay === "true",
+    overlayLogo: body.overlayLogo || null,
+    watermark: body.watermark || null,
+    zoom: body.zoom || null,
+    zoomFactor: body.zoomFactor || 1.0,
+    cropX: body.cropX || null,
+    cropY: body.cropY || null,
+    focusX: body.focusX || 0.5,
+    focusY: body.focusY || 0.5,
+    aspectMode: body.aspectMode || body.aspect_mode || "fill"
+  };
+}
+
+// ================================
 // Render from uploaded panels (background)
 // ================================
 
@@ -1071,7 +1137,7 @@ async function renderFromProject(req, jobId) {
   const batchIndex   = Number(req.body.batchIndex   || req.body.batch_index   || 0);
   const totalBatches = Number(req.body.totalBatches || req.body.total_batches || 1);
   const panelCount   = panels.length;
-  const aspectMode   = String(req.body.aspectMode || req.body.aspect_mode || "fill").toLowerCase().trim();
+  const renderOptions = extractRenderOptions(req.body);
 
   updateJob(jobId, { batchIndex, totalBatches });
 
@@ -1082,9 +1148,8 @@ async function renderFromProject(req, jobId) {
     console.log(`[${RENDERER_NAME}][${jobId}] Starting validation — ${panels.length} panels`);
     await validateRenderPanels(panels);
 
-    console.log(`[${RENDERER_NAME}][${jobId}] Starting render — ${panels.length} panels — batch ${batchIndex + 1}/${totalBatches} — panelCount=${panelCount} — aspectMode=${aspectMode}`);
+    console.log(`[${RENDERER_NAME}][${jobId}] Starting render — ${panels.length} panels — batch ${batchIndex + 1}/${totalBatches} — panelCount=${panelCount} — renderOptions=${JSON.stringify(renderOptions)}`);
 
-    // CHANGE 5: Use createSegmentSafe with skip support
     let skipped = 0;
     for (let i = 0; i < panels.length; i++) {
       const p   = panels[i];
@@ -1101,7 +1166,7 @@ async function renderFromProject(req, jobId) {
         jobId,
         idx: i,
         panelCount,
-        aspectMode
+        renderOptions
       });
 
       if (result.success) {
@@ -1126,7 +1191,7 @@ async function renderFromProject(req, jobId) {
     updateJob(jobId, { progress: 85 });
 
     const finalPath = path.join(OUTPUT_ROOT, `${jobId}_final.mp4`);
-    await concatWithTransitions(segPaths, durations, finalPath);
+    await concatWithTransitions(segPaths, durations, finalPath, renderOptions);
     cleanupFiles(segPaths);
 
     const host = `https://${process.env.RAILWAY_PUBLIC_DOMAIN || req.get("host")}`;
@@ -1136,7 +1201,6 @@ async function renderFromProject(req, jobId) {
       try { fs.unlinkSync(finalPath); } catch (_) {}
     }, 2 * 60 * 60 * 1000);
 
-    // CHANGE 6: Include rendered + skipped counts in job result
     updateJob(jobId, {
       status: "done",
       progress: 100,
@@ -1152,7 +1216,12 @@ async function renderFromProject(req, jobId) {
       totalBatches,
       renderer: RENDERER_NAME,
       format: "MP4 (H264 Video + AAC Audio)",
-      device_support: "Universal (iOS, Android, Chrome, Safari, Edge)"
+      device_support: "Universal (iOS, Android, Chrome, Safari, Edge)",
+      encodingSettings: {
+        crf: renderOptions.crf,
+        preset: renderOptions.preset,
+        audioNormalize: renderOptions.audioNormalize
+      }
     });
 
     scheduleJobEviction(jobId);
@@ -1184,7 +1253,7 @@ async function renderFromMultipart(req, jobId) {
   const batchIndex   = Number(req.body.batchIndex   || req.body.batch_index   || 0);
   const totalBatches = Number(req.body.totalBatches || req.body.total_batches || 1);
   const panelCount   = req.files.length;
-  const aspectMode   = String(req.body.aspectMode || req.body.aspect_mode || "fill").toLowerCase().trim();
+  const renderOptions = extractRenderOptions(req.body);
 
   updateJob(jobId, { batchIndex, totalBatches });
 
@@ -1195,9 +1264,8 @@ async function renderFromMultipart(req, jobId) {
 
     while (lines.length < req.files.length) lines.push("");
 
-    console.log(`[${RENDERER_NAME}][${jobId}] Starting multipart render — ${req.files.length} images — batch ${batchIndex + 1}/${totalBatches} — panelCount=${panelCount} — aspectMode=${aspectMode}`);
+    console.log(`[${RENDERER_NAME}][${jobId}] Starting multipart render — ${req.files.length} images — batch ${batchIndex + 1}/${totalBatches} — panelCount=${panelCount} — renderOptions=${JSON.stringify(renderOptions)}`);
 
-    // CHANGE 5: Use createSegmentSafe with skip support
     let skipped = 0;
     for (let i = 0; i < req.files.length; i++) {
       const segPath  = path.join(TEMP_ROOT, `seg_${jobId}_${i}.mp4`);
@@ -1213,7 +1281,7 @@ async function renderFromMultipart(req, jobId) {
         jobId,
         idx: i,
         panelCount,
-        aspectMode
+        renderOptions
       });
 
       if (result.success) {
@@ -1238,7 +1306,7 @@ async function renderFromMultipart(req, jobId) {
     updateJob(jobId, { progress: 85 });
 
     const finalPath = path.join(OUTPUT_ROOT, `${jobId}_final.mp4`);
-    await concatWithTransitions(segPaths, durations, finalPath);
+    await concatWithTransitions(segPaths, durations, finalPath, renderOptions);
     cleanupFiles([...segPaths, ...uploadPaths]);
 
     const host = `https://${process.env.RAILWAY_PUBLIC_DOMAIN || req.get("host")}`;
@@ -1248,7 +1316,6 @@ async function renderFromMultipart(req, jobId) {
       try { fs.unlinkSync(finalPath); } catch (_) {}
     }, 2 * 60 * 60 * 1000);
 
-    // CHANGE 6: Include rendered + skipped counts in job result
     updateJob(jobId, {
       status: "done",
       progress: 100,
@@ -1263,7 +1330,12 @@ async function renderFromMultipart(req, jobId) {
       totalBatches,
       renderer: RENDERER_NAME,
       format: "MP4 (H264 Video + AAC Audio)",
-      device_support: "Universal (iOS, Android, Chrome, Safari, Edge)"
+      device_support: "Universal (iOS, Android, Chrome, Safari, Edge)",
+      encodingSettings: {
+        crf: renderOptions.crf,
+        preset: renderOptions.preset,
+        audioNormalize: renderOptions.audioNormalize
+      }
     });
 
     scheduleJobEviction(jobId);
