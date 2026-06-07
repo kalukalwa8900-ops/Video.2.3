@@ -60,8 +60,10 @@ console.log(`✓ FFprobe Path: ${FFPROBE_PATH}`);
 // ================================
 
 app.use(cors());
-app.use(express.json({ limit: "200mb" }));
-app.use(express.urlencoded({ extended: true, limit: "200mb" }));
+
+// FIX #2: Increase Request Limits
+app.use(express.json({ limit: "2gb" }));
+app.use(express.urlencoded({ extended: true, limit: "2gb" }));
 app.use(express.static(path.join(__dirname, "public")));
 app.use("/output", express.static(path.join(__dirname, "output")));
 
@@ -283,12 +285,21 @@ function validateSegment(segPath) {
 }
 
 // ================================
-// Multer
+// Multer - FIX #1: Use diskStorage instead of memoryStorage
 // ================================
 
+// FIX #1: Panel upload now uses diskStorage for better memory handling
+const panelDiskStorage = multer.diskStorage({
+  destination: UPLOADS_ROOT,
+  filename: (_req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase() || ".jpg";
+    cb(null, `panel_${Date.now()}_${crypto.randomBytes(4).toString("hex")}${ext}`);
+  }
+});
+
 const panelUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 150 * 1024 * 1024, files: 4 }
+  storage: panelDiskStorage,
+  limits: { fileSize: 500 * 1024 * 1024, files: 4 }
 });
 
 const diskStorage = multer.diskStorage({
@@ -307,9 +318,17 @@ const diskUpload = multer({
   }
 });
 
+// FIX #1: Audio ZIP upload now uses diskStorage instead of memoryStorage
+const zipDiskStorage = multer.diskStorage({
+  destination: TEMP_ROOT,
+  filename: (_req, file, cb) => {
+    cb(null, `audio_zip_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.zip`);
+  }
+});
+
 const zipUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 300 * 1024 * 1024, files: 1 }
+  storage: zipDiskStorage,
+  limits: { fileSize: 500 * 1024 * 1024, files: 1 }
 });
 
 // ================================
@@ -848,9 +867,11 @@ app.post(
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       });
 
-      const imageBuffer = req.files.image[0].buffer;
+      // FIX #1: Read from disk instead of buffer
+      const imageBuffer = fs.readFileSync(req.files.image[0].path);
       const imagePath = path.join(panelDir, `image.jpg`);
       fs.writeFileSync(imagePath, imageBuffer);
+      fs.unlinkSync(req.files.image[0].path); // Clean up temp file
 
       let audioPath = null;
       let audioFileName = null;
@@ -858,7 +879,9 @@ app.post(
         const audioExt = extFor(req.files.audio[0], ".mp3");
         audioFileName = `audio${audioExt}`;
         audioPath = path.join(panelDir, audioFileName);
-        fs.writeFileSync(audioPath, req.files.audio[0].buffer);
+        const audioBuffer = fs.readFileSync(req.files.audio[0].path);
+        fs.writeFileSync(audioPath, audioBuffer);
+        fs.unlinkSync(req.files.audio[0].path); // Clean up temp file
       }
 
       const index = Number(req.body.index || 0);
@@ -912,7 +935,11 @@ app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
       return res.status(404).json({ success: false, error: "Project not found. Upload panels first." });
     }
 
-    const zip = new AdmZip(req.file.buffer);
+    // FIX #1: Read from disk instead of memory buffer
+    const zipBuffer = fs.readFileSync(req.file.path);
+    const zip = new AdmZip(zipBuffer);
+    fs.unlinkSync(req.file.path); // Clean up temp file
+    
     const entries = zip.getEntries();
 
     const mp3Entries = entries
@@ -1388,8 +1415,11 @@ setInterval(() => {
 // START
 // ================================
 
-app.listen(PORT, "0.0.0.0", () => {
+const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`ScriptReel running on port ${PORT}`);
   console.log(`Renderer: ${RENDERER_NAME}`);
   console.log(`FFmpeg: ${FFMPEG_PATH}`);
 });
+
+// FIX #4: Add Upload Timeout Safety
+server.timeout = 0;
