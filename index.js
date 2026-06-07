@@ -333,18 +333,18 @@ const zipUpload = multer({
 });
 
 // ================================
-// Smart FPS helper by panel count
+// Smart FPS helper by panel count — OPTIMIZED
 // ================================
 
 function getFps(panelCount) {
-  if (panelCount <= 100)  return 20;
-  if (panelCount <= 500)  return 15;
-  if (panelCount <= 1000) return 12;
-  return 10; // 1000–2000 panels
+  if (panelCount <= 100)  return 12;   // ← Reduced from 20
+  if (panelCount <= 500)  return 10;   // ← Reduced from 15
+  if (panelCount <= 1000) return 8;    // ← Reduced from 12
+  return 6;                             // ← Reduced from 10 (was "1000-2000 panels")
 }
 
 // ================================
-// Ken Burns Animation Presets
+// Ken Burns Animation Presets — OPTIMIZED
 // ================================
 
 function getKenBurnsFilter(idx, duration, panelCount = 1, aspectMode = "fill") {
@@ -359,11 +359,12 @@ function getKenBurnsFilter(idx, duration, panelCount = 1, aspectMode = "fill") {
     PRE = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black";
   }
 
-  const zoomInStep  = "0.0019";
+  // OPTIMIZED: Gentler animation parameters
+  const zoomInStep  = "0.0008";    // ← Reduced from 0.0019
   const zoomOutStart = "1.5";
-  const zoomOutStep = "0.0019";
-  const panSpeed    = "2.5";
-  const diagSpeed   = "1.8";
+  const zoomOutStep = "0.0008";    // ← Reduced from 0.0019
+  const panSpeed    = "1.2";       // ← Reduced from 2.5
+  const diagSpeed   = "0.9";       // ← Reduced from 1.8
 
   const animations = [
     `${PRE},zoompan=z='min(zoom+${zoomInStep},1.5)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=${fps}`,
@@ -464,6 +465,7 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
       `-r ${fps}`,
       `-crf ${crf}`,
       `-preset ${preset}`,
+      `-threads 2`,
       `-movflags ${movflags}`,
       `-c:a aac`,
       `-b:a ${audioBitrate}`,
@@ -614,7 +616,7 @@ async function concatWithTransitions(segPaths, durations, outPath, renderOptions
   }
 
   if (n <= BATCH_SIZE) {
-    const USE_XFADE = n <= 30;
+    const USE_XFADE = n <= 10;  // ← Optimized from n <= 30
     console.log(`[concat] strategy=${USE_XFADE ? "xfade" : "simple-concat"} (${n} clips)`);
     if (USE_XFADE) {
       await concatWithXfade(segPaths, durations, outPath, renderOptions);
@@ -651,7 +653,7 @@ async function batchMerge(segPaths, durations, outPath, renderOptions = {}) {
 
     console.log(`[batchMerge] batch ${b + 1}/${batchCount}: clips ${start + 1}–${end}`);
 
-    const USE_XFADE = batchSegs.length <= 30;
+    const USE_XFADE = batchSegs.length <= 10;  // ← Optimized from <= 30
     if (USE_XFADE) {
       await concatWithXfade(batchSegs, batchDurs, batchOut, renderOptions);
     } else {
@@ -677,7 +679,7 @@ async function batchMerge(segPaths, durations, outPath, renderOptions = {}) {
 }
 
 // ================================
-// xfade concat (≤30 clips) with render options
+// xfade concat (≤10 clips) with render options
 // ================================
 
 async function concatWithXfade(segPaths, durations, outPath, renderOptions = {}) {
@@ -719,6 +721,7 @@ async function concatWithXfade(segPaths, durations, outPath, renderOptions = {})
     "-pix_fmt", pixFmt,
     "-crf", String(crf),
     "-preset", preset,
+    "-threads", "2",
     "-movflags", "+faststart",
     "-c:a", "aac",
     "-b:a", audioBitrate,
@@ -737,7 +740,7 @@ async function concatWithXfade(segPaths, durations, outPath, renderOptions = {})
 }
 
 // ================================
-// simple concat (>30 clips or fallback) with render options
+// simple concat (>10 clips or fallback) with render options
 // ================================
 
 async function concatSimple(segPaths, outPath, renderOptions = {}) {
@@ -754,6 +757,7 @@ async function concatSimple(segPaths, outPath, renderOptions = {}) {
     "-f", "concat",
     "-safe", "0",
     "-i", concatFile,
+    "-threads", "2",
     "-c:v", "libx264",
     "-pix_fmt", pixFmt,
     "-crf", String(crf),
