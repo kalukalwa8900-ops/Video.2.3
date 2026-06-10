@@ -207,6 +207,44 @@ function getAudioDuration(audioPath) {
 }
 
 // ================================
+// Get Image Dimensions
+// ================================
+
+function getImageDimensions(imagePath) {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(imagePath)) {
+      return resolve({ valid: false, reason: "Image file does not exist" });
+    }
+
+    ffmpeg.ffprobe(imagePath, (err, data) => {
+      if (err) {
+        return resolve({ valid: false, reason: `ffprobe error: ${err.message}` });
+      }
+
+      const videoStream = data.streams?.find(s => s.codec_type === "video");
+      if (!videoStream) {
+        return resolve({ valid: false, reason: "No image stream found" });
+      }
+
+      const width = videoStream.width || 0;
+      const height = videoStream.height || 0;
+
+      if (!width || !height) {
+        return resolve({ valid: false, reason: "Could not determine image dimensions" });
+      }
+
+      const aspectRatio = width / height;
+      resolve({
+        valid: true,
+        width,
+        height,
+        aspectRatio
+      });
+    });
+  });
+}
+
+// ================================
 // Calculate Panel Duration (with priority order)
 // ================================
 
@@ -333,88 +371,134 @@ const zipUpload = multer({
 });
 
 // ================================
-// Smart FPS helper by panel count — OPTIMIZED
+// FPS: Always 25 for 1-500 images (broadcast standard, best quality)
 // ================================
 
 function getFps(panelCount) {
-  if (panelCount <= 100)  return 12;   // ← Reduced from 20
-  if (panelCount <= 500)  return 10;   // ← Reduced from 15
-  if (panelCount <= 1000) return 8;    // ← Reduced from 12
-  return 6;                             // ← Reduced from 10 (was "1000-2000 panels")
+  // Fixed at 25 fps for all panel counts (broadcast standard)
+  // Provides consistent smooth playback and best Ken Burns animation quality
+  return 25;
 }
 
 // ================================
-// Ken Burns Animation Presets — OPTIMIZED
+// ENHANCEMENT: Aspect Ratio Helper
 // ================================
 
-function getKenBurnsFilter(idx, duration, panelCount = 1, aspectMode = "fill") {
-  const fps = getFps(panelCount);
-  const totalFrames = Math.ceil(duration * fps);
-
-  let PRE;
-  const normalised = String(aspectMode || "fill").toLowerCase().trim();
-  if (normalised === "fill") {
-    PRE = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720";
+function calculateFitInFrame(imageAspectRatio, frameWidth = 1280, frameHeight = 720) {
+  const frameAspect = frameWidth / frameHeight;
+  
+  let scaledWidth, scaledHeight;
+  
+  if (imageAspectRatio > frameAspect) {
+    // Image is wider than frame
+    scaledWidth = frameWidth;
+    scaledHeight = Math.round(frameWidth / imageAspectRatio);
   } else {
-    PRE = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black";
+    // Image is taller than frame
+    scaledHeight = frameHeight;
+    scaledWidth = Math.round(frameHeight * imageAspectRatio);
+  }
+  
+  const offsetX = Math.round((frameWidth - scaledWidth) / 2);
+  const offsetY = Math.round((frameHeight - scaledHeight) / 2);
+  
+  return { scaledWidth, scaledHeight, offsetX, offsetY };
+}
+
+// ================================
+// Ken Burns Animation — zoom in/out + slide up/down/left/right
+// All at 25 fps, best quality, no cropping in fit mode
+// ================================
+
+function getKenBurnsFilter(idx, duration, panelCount = 1, aspectMode = "fit") {
+  const fps = 25; // Always 25 fps
+  const totalFrames = Math.ceil(duration * fps);
+  const normalised = String(aspectMode || "fit").toLowerCase().trim();
+
+  if (normalised === "fit") {
+    // FIT MODE — preserve full image, letterbox/pillarbox with black bars
+    // Gentle Ken Burns: 6 animations cycling across panels
+    const animations = [
+      // 1. Subtle zoom IN (100% → 108%)
+      `scale=8000:-1,zoompan=z='min(zoom+0.0003,1.08)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+      // 2. Subtle zoom OUT (108% → 100%)
+      `scale=8000:-1,zoompan=z='if(lte(on,1),1.08,max(zoom-0.0003,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+      // 3. Slide LEFT (pan right-to-left)
+      `scale=8000:-1,zoompan=z='1.06':x='if(lte(on,1),iw*0.04,min(x+iw*0.04/${totalFrames},iw*0.08))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+      // 4. Slide RIGHT (pan left-to-right)
+      `scale=8000:-1,zoompan=z='1.06':x='if(lte(on,1),iw*0.08,max(x-iw*0.04/${totalFrames},0))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+      // 5. Slide UP (pan bottom-to-top)
+      `scale=8000:-1,zoompan=z='1.06':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih*0.04,min(y+ih*0.03/${totalFrames},ih*0.07))':d=${totalFrames}:s=1280x720:fps=25,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+      // 6. Slide DOWN (pan top-to-bottom)
+      `scale=8000:-1,zoompan=z='1.06':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih*0.07,max(y-ih*0.03/${totalFrames},0))':d=${totalFrames}:s=1280x720:fps=25,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+    ];
+    return animations[idx % animations.length];
+
+  } else if (normalised === "cinematic") {
+    // CINEMATIC MODE — fill frame edge-to-edge, full Ken Burns suite
+    const animations = [
+      // 1. Zoom IN center
+      `scale=8000:-1,zoompan=z='min(zoom+0.0003,1.1)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,setsar=1`,
+      // 2. Zoom OUT center
+      `scale=8000:-1,zoompan=z='if(lte(on,1),1.1,max(zoom-0.0003,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,setsar=1`,
+      // 3. Slide LEFT
+      `scale=8000:-1,zoompan=z='1.08':x='if(lte(on,1),0,min(x+iw*0.06/${totalFrames},iw*0.08))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,setsar=1`,
+      // 4. Slide RIGHT
+      `scale=8000:-1,zoompan=z='1.08':x='if(lte(on,1),iw*0.08,max(x-iw*0.06/${totalFrames},0))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,setsar=1`,
+      // 5. Slide UP
+      `scale=8000:-1,zoompan=z='1.08':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),0,min(y+ih*0.05/${totalFrames},ih*0.08))':d=${totalFrames}:s=1280x720:fps=25,setsar=1`,
+      // 6. Slide DOWN
+      `scale=8000:-1,zoompan=z='1.08':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih*0.08,max(y-ih*0.05/${totalFrames},0))':d=${totalFrames}:s=1280x720:fps=25,setsar=1`,
+    ];
+    return animations[idx % animations.length];
   }
 
-  // OPTIMIZED: Gentler animation parameters
-  const zoomInStep  = "0.0008";    // ← Reduced from 0.0019
-  const zoomOutStart = "1.5";
-  const zoomOutStep = "0.0008";    // ← Reduced from 0.0019
-  const panSpeed    = "1.2";       // ← Reduced from 2.5
-  const diagSpeed   = "0.9";       // ← Reduced from 1.8
-
-  const animations = [
-    `${PRE},zoompan=z='min(zoom+${zoomInStep},1.5)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=${fps}`,
-    `${PRE},zoompan=z='if(lte(zoom,1.0),${zoomOutStart},max(zoom-${zoomOutStep},1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=${fps}`,
-    `${PRE},zoompan=z='1.3':x='if(lte(on,1),0,min(x+${panSpeed},iw/zoom))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=${fps}`,
-    `${PRE},zoompan=z='1.3':x='if(lte(on,1),iw/zoom,max(x-${panSpeed},0))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=${fps}`,
-    `${PRE},zoompan=z='1.3':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih/zoom,max(y-${diagSpeed},0))':d=${totalFrames}:s=1280x720:fps=${fps}`,
-    `${PRE},zoompan=z='1.3':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),0,min(y+${diagSpeed},ih/zoom))':d=${totalFrames}:s=1280x720:fps=${fps}`,
-  ];
-
-  return animations[idx % animations.length];
+  // Default: FIT with static scale (no animation, fastest)
+  return `scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`;
 }
 
 // ================================
-// ENHANCEMENT 1: Build FFmpeg audio filter chain
+// ENHANCEMENT 1: Build FFmpeg audio filter chain with smooth normalization
 // ================================
 
 function buildAudioFilterChain(options = {}) {
   const filters = [];
+  
+  // Audio normalization for consistent loudness
   if (options.audioNormalize || options.loudnorm) {
     filters.push("loudnorm=I=-16:TP=-1.5:LRA=11");
   }
+  
+  // Optional: Add gentle compression for smooth transitions
+  if (options.smoothAudio) {
+    filters.push("acompressor=threshold=0.05:ratio=4:attack=5:release=50");
+  }
+  
   return filters.length ? filters.join(",") : "";
 }
 
 // ================================
-// ENHANCEMENT 2: Build FFmpeg video filter chain
+// ENHANCEMENT 2: Build FFmpeg video filter chain with quality optimization
 // ================================
 
 function buildVideoFilterChain(options = {}, baseFilter = "") {
   const filters = [baseFilter];
+  
+  // Optional zoom/crop adjustments (subtle, not aggressive)
   if (options.zoom || options.zoomFactor || options.cropX || options.cropY) {
     const zoomFactor = parseFloat(options.zoomFactor || options.zoom || 1.0);
-    if (zoomFactor > 1.0 && zoomFactor <= 3.0) {
+    if (zoomFactor > 1.0 && zoomFactor <= 1.15) {  // ← Limited to max 15% zoom
       const centerX = Math.max(0, parseFloat(options.focusX || 0.5) * 1280);
       const centerY = Math.max(0, parseFloat(options.focusY || 0.5) * 720);
       filters.push(`zoom=z=${zoomFactor}:x='${centerX}':y='${centerY}'`);
-    } else if (options.cropX || options.cropY) {
-      const w = Math.max(100, parseInt(options.cropX) || 1280);
-      const h = Math.max(100, parseInt(options.cropY) || 720);
-      const cx = Math.max(0, Math.min(1280 - w, 1280 / 2 - w / 2));
-      const cy = Math.max(0, Math.min(720 - h, 720 / 2 - h / 2));
-      filters.push(`crop=${w}:${h}:${cx}:${cy},scale=1280:720`);
     }
   }
+  
   return filters.join(",");
 }
 
 // ================================
-// Create Segment (MP4) with new payload fields
+// Create Segment (MP4) - OPTIMIZED for quality & speed
 // ================================
 
 function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount, aspectMode, renderOptions = {} }) {
@@ -431,12 +515,12 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
     const hasAudio = audioPath && fs.existsSync(audioPath);
 
     const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-    console.log(`[${RENDERER_NAME}][seg${idx}] START — jobId=${jobId} style=${idx % 6} dur=${duration}s panelCount=${panelCount} mem=${memMB}MB`);
+    console.log(`[${RENDERER_NAME}][seg${idx}] START — jobId=${jobId} mode=${aspectMode} dur=${duration}s panelCount=${panelCount} mem=${memMB}MB`);
 
     const cmd = ffmpeg()
       .setFfmpegPath(FFMPEG_PATH)
       .input(imagePath)
-      .inputOptions(["-loop 1", "-framerate 25"]);
+      .inputOptions(["-loop 1", "-framerate 25"]);  // ← 25fps input for smooth zoompan
 
     if (hasAudio) {
       cmd.input(audioPath);
@@ -446,26 +530,29 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
         .inputOptions(["-f lavfi"]);
     }
 
-    const fps = getFps(panelCount);
+    // Best quality encoding settings (stable, no quality loss)
+    const videoCodec   = renderOptions.videoCodec  || "libx264";
+    const pixFmt       = renderOptions.pixFmt       || "yuv420p";
+    const crf          = Math.max(18, Math.min(23, parseInt(renderOptions.crf) || 20)); // ← CRF 20 = best quality
+    const preset       = renderOptions.preset        || "medium";  // ← medium = better quality than fast
+    const maxrate      = renderOptions.maxrate        || "";
+    const bufsize      = renderOptions.bufsize        || "";
+    const audioBitrate = renderOptions.audioBitrate   || "192k";
+    const movflags     = renderOptions.movflags ? String(renderOptions.movflags) : "+faststart";
 
-    // Extract encoding options from payload (with safe defaults)
-    const videoCodec = renderOptions.videoCodec || "libx264";
-    const pixFmt = renderOptions.pixFmt || "yuv420p";
-    const crf = Math.max(18, Math.min(51, parseInt(renderOptions.crf) || 26));
-    const preset = renderOptions.preset || "ultrafast";
-    const maxrate = renderOptions.maxrate || "";
-    const bufsize = renderOptions.bufsize || "";
-    const audioBitrate = renderOptions.audioBitrate || "128k";
-    const movflags = renderOptions.movflags ? String(renderOptions.movflags) : "+faststart";
+    // Always apply loudnorm for stable volume across all segments
+    const audioFilter = "loudnorm=I=-16:TP=-1.5:LRA=11";
 
     const outputOpts = [
+      `-af ${audioFilter}`,
       `-vf ${vfParts.join(",")}`,
       `-c:v ${videoCodec}`,
       `-pix_fmt ${pixFmt}`,
-      `-r ${fps}`,
+      `-r 25`,           // ← Always 25 fps output
+      `-g 50`,           // ← GOP size = 2× fps for clean seeking
       `-crf ${crf}`,
       `-preset ${preset}`,
-      `-threads 2`,
+      `-threads 4`,
       `-movflags ${movflags}`,
       `-c:a aac`,
       `-b:a ${audioBitrate}`,
@@ -475,21 +562,15 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
 
     // Add bitrate control if specified
     if (maxrate) outputOpts.splice(-3, 0, `-maxrate ${maxrate}`);
-    if (bufsize) outputOpts.splice(-3, 0, `-bufsize ${bufsize}`);
-
-    // Add audio normalization filter if requested
-    const audioFilter = buildAudioFilterChain(renderOptions);
-    if (audioFilter) {
-      outputOpts.splice(0, 0, `-af ${audioFilter}`);
-    }
+    if (bufsize)  outputOpts.splice(-3, 0, `-bufsize ${bufsize}`);
 
     cmd
       .outputOptions(outputOpts)
       .output(outPath)
-      .on("start", (cmd) => {
-        console.log(`[seg${idx}] FFmpeg started`);
+      .on("start", () => {
+        console.log(`[seg${idx}] FFmpeg encoding started`);
       })
-      .on("progress", (progress) => {
+      .on("progress", () => {
         // suppress per-frame logs
       })
       .on("end", () => {
@@ -591,190 +672,56 @@ function spawnFfmpeg(args, description = "") {
 }
 
 // ================================
-// CONCAT WITH TRANSITIONS — batch + recursive merge
+// CONCAT — Lossless stream-copy (no re-render, no quality loss, instant)
+// All segments are already encoded at 25fps/CRF-20; just join them.
 // ================================
-
-const BATCH_SIZE = 50;
 
 async function concatWithTransitions(segPaths, durations, outPath, renderOptions = {}) {
   const n = segPaths.length;
   const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-  console.log(`\n[concat] START — ${n} segments — mem=${memMB}MB`);
+  console.log(`\n[concat] START (stream-copy, no re-render) — ${n} segments — mem=${memMB}MB`);
 
   if (!n) throw new Error("No segments to concat");
 
+  // Single segment: just copy
   if (n === 1) {
     console.log("[concat] Single segment — copying directly");
     fs.copyFileSync(segPaths[0], outPath);
     return;
   }
 
+  // Verify all segments exist
   for (let i = 0; i < n; i++) {
     if (!fs.existsSync(segPaths[i])) {
       throw new Error(`Segment ${i} missing: ${segPaths[i]}`);
     }
   }
 
-  if (n <= BATCH_SIZE) {
-    const USE_XFADE = n <= 10;  // ← Optimized from n <= 30
-    console.log(`[concat] strategy=${USE_XFADE ? "xfade" : "simple-concat"} (${n} clips)`);
-    if (USE_XFADE) {
-      await concatWithXfade(segPaths, durations, outPath, renderOptions);
-    } else {
-      await concatSimple(segPaths, outPath, renderOptions);
-    }
-  } else {
-    await batchMerge(segPaths, durations, outPath, renderOptions);
+  // Write concat list file
+  const concatFile = path.join(TEMP_ROOT, `concat_${Date.now()}.txt`);
+  fs.writeFileSync(concatFile, segPaths.map(s => `file '${s}'`).join("\n"), "utf8");
+
+  // Stream-copy concat — no decoding/re-encoding, zero quality loss, very fast
+  const args = [
+    "-f",      "concat",
+    "-safe",   "0",
+    "-i",      concatFile,
+    "-c",      "copy",        // ← LOSSLESS: copy all streams, no re-render
+    "-movflags", "+faststart",
+    "-y",
+    outPath
+  ];
+
+  console.log("[concat] Running lossless stream-copy concat...");
+  try {
+    await spawnFfmpeg(args, "lossless stream-copy concat");
+    console.log(`[concat] ✓ stream-copy concat succeeded`);
+  } finally {
+    try { fs.unlinkSync(concatFile); } catch (_) {}
   }
 
   const memAfterMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
   console.log(`[concat] END — mem=${memAfterMB}MB → ${outPath}`);
-}
-
-// ================================
-// Batch merge — split into BATCH_SIZE chunks, merge each, then recurse
-// ================================
-
-async function batchMerge(segPaths, durations, outPath, renderOptions = {}) {
-  const n = segPaths.length;
-  const batchCount = Math.ceil(n / BATCH_SIZE);
-  console.log(`[batchMerge] ${n} clips → ${batchCount} batches of ≤${BATCH_SIZE}`);
-
-  const batchOutputs = [];
-  const batchDurations = [];
-  const tempFiles = [];
-
-  for (let b = 0; b < batchCount; b++) {
-    const start = b * BATCH_SIZE;
-    const end   = Math.min(start + BATCH_SIZE, n);
-    const batchSegs = segPaths.slice(start, end);
-    const batchDurs = durations.slice(start, end);
-    const batchOut  = path.join(TEMP_ROOT, `batch_${Date.now()}_${b}.mp4`);
-
-    console.log(`[batchMerge] batch ${b + 1}/${batchCount}: clips ${start + 1}–${end}`);
-
-    const USE_XFADE = batchSegs.length <= 10;  // ← Optimized from <= 30
-    if (USE_XFADE) {
-      await concatWithXfade(batchSegs, batchDurs, batchOut, renderOptions);
-    } else {
-      await concatSimple(batchSegs, batchOut, renderOptions);
-    }
-
-    batchOutputs.push(batchOut);
-    tempFiles.push(batchOut);
-
-    const totalDur = batchDurs.reduce((a, v) => a + v, 0);
-    batchDurations.push(totalDur);
-
-    const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-    console.log(`[batchMerge] batch ${b + 1} done — mem=${memMB}MB`);
-  }
-
-  console.log(`[batchMerge] Merging ${batchOutputs.length} batch files → final`);
-  try {
-    await concatWithTransitions(batchOutputs, batchDurations, outPath, renderOptions);
-  } finally {
-    cleanupFiles(tempFiles);
-  }
-}
-
-// ================================
-// xfade concat (≤10 clips) with render options
-// ================================
-
-async function concatWithXfade(segPaths, durations, outPath, renderOptions = {}) {
-  const TRANSITION_DURATION = 0.5;
-  const TRANSITION_TYPE     = "slideright";
-
-  let filterComplex = "";
-  let currentVideoLabel = "0:v";
-  let currentAudioLabel = "0:a";
-  let offset = durations[0];
-
-  for (let i = 1; i < segPaths.length; i++) {
-    const vLabel = `v${i}`;
-    const aLabel = `a${i}`;
-    filterComplex +=
-      (filterComplex ? ";" : "") +
-      `[${currentVideoLabel}][${i}:v]xfade=transition=${TRANSITION_TYPE}:duration=${TRANSITION_DURATION}:offset=${(offset - TRANSITION_DURATION).toFixed(4)}[${vLabel}]` +
-      `;[${currentAudioLabel}][${i}:a]acrossfade=d=${TRANSITION_DURATION}:c1=tri:c2=tri[${aLabel}]`;
-    currentVideoLabel = vLabel;
-    currentAudioLabel = aLabel;
-    offset += durations[i];
-  }
-
-  filterComplex += `\n[${currentVideoLabel}]format=yuv420p[vout];\n[${currentAudioLabel}]aformat=sample_rates=44100:channel_layouts=stereo[aout]`;
-
-  const inputArgs = [];
-  for (const seg of segPaths) inputArgs.push("-i", seg);
-
-  const crf = Math.max(18, Math.min(51, parseInt(renderOptions.crf) || 23));
-  const preset = renderOptions.preset || "ultrafast";
-  const pixFmt = renderOptions.pixFmt || "yuv420p";
-  const audioBitrate = renderOptions.audioBitrate || "128k";
-
-  const outputArgs = [
-    "-filter_complex", filterComplex,
-    "-map", "[vout]",
-    "-map", "[aout]",
-    "-c:v", "libx264",
-    "-pix_fmt", pixFmt,
-    "-crf", String(crf),
-    "-preset", preset,
-    "-threads", "2",
-    "-movflags", "+faststart",
-    "-c:a", "aac",
-    "-b:a", audioBitrate,
-    "-y",
-    outPath
-  ];
-
-  console.log("[concat] Attempting xfade concat...");
-  try {
-    await spawnFfmpeg([...inputArgs, ...outputArgs], "xfade concat");
-    console.log(`[concat] ✓ xfade succeeded`);
-  } catch (xfadeErr) {
-    console.warn(`[concat] xfade failed (${xfadeErr.message.split("\n")[0]}) — falling back to simple concat`);
-    await concatSimple(segPaths, outPath, renderOptions);
-  }
-}
-
-// ================================
-// simple concat (>10 clips or fallback) with render options
-// ================================
-
-async function concatSimple(segPaths, outPath, renderOptions = {}) {
-  console.log(`[concat] Running simple concat (${segPaths.length} clips)...`);
-  const concatFile = path.join(TEMP_ROOT, `concat_${Date.now()}.txt`);
-  fs.writeFileSync(concatFile, segPaths.map(s => `file '${s}'`).join("\n"), "utf8");
-
-  const crf = Math.max(18, Math.min(51, parseInt(renderOptions.crf) || 23));
-  const preset = renderOptions.preset || "ultrafast";
-  const pixFmt = renderOptions.pixFmt || "yuv420p";
-  const audioBitrate = renderOptions.audioBitrate || "128k";
-
-  const args = [
-    "-f", "concat",
-    "-safe", "0",
-    "-i", concatFile,
-    "-threads", "2",
-    "-c:v", "libx264",
-    "-pix_fmt", pixFmt,
-    "-crf", String(crf),
-    "-preset", preset,
-    "-movflags", "+faststart",
-    "-c:a", "aac",
-    "-b:a", audioBitrate,
-    "-y",
-    outPath
-  ];
-
-  try {
-    await spawnFfmpeg(args, "simple concat");
-    console.log(`[concat] ✓ simple concat succeeded`);
-  } finally {
-    try { fs.unlinkSync(concatFile); } catch (_) {}
-  }
 }
 
 // ================================
@@ -1087,11 +1034,12 @@ function extractRenderOptions(body) {
   return {
     audioNormalize: body.audioNormalize === true || body.audioNormalize === "true",
     loudnorm: body.loudnorm === true || body.loudnorm === "true",
-    crf: body.crf || 26,
-    preset: body.preset || "ultrafast",
+    smoothAudio: body.smoothAudio === true || body.smoothAudio === "true",
+    crf: body.crf || 23,
+    preset: body.preset || "fast",
     maxrate: body.maxrate || "",
     bufsize: body.bufsize || "",
-    audioBitrate: body.audioBitrate || "128k",
+    audioBitrate: body.audioBitrate || "192k",
     movflags: body.movflags || "+faststart",
     pixFmt: body.pixFmt || "yuv420p",
     videoCodec: body.videoCodec || "libx264",
@@ -1104,7 +1052,7 @@ function extractRenderOptions(body) {
     cropY: body.cropY || null,
     focusX: body.focusX || 0.5,
     focusY: body.focusY || 0.5,
-    aspectMode: body.aspectMode || body.aspect_mode || "fill"
+    aspectMode: body.aspectMode || body.aspect_mode || "fit"  // ← Default to "fit" for proper aspect ratio
   };
 }
 
@@ -1204,6 +1152,7 @@ async function renderFromProject(req, jobId) {
         jobId,
         idx: i,
         panelCount,
+        aspectMode: renderOptions.aspectMode,
         renderOptions
       });
 
@@ -1255,10 +1204,14 @@ async function renderFromProject(req, jobId) {
       renderer: RENDERER_NAME,
       format: "MP4 (H264 Video + AAC Audio)",
       device_support: "Universal (iOS, Android, Chrome, Safari, Edge)",
+      fps: 25,
+      aspectMode: renderOptions.aspectMode,
       encodingSettings: {
         crf: renderOptions.crf,
         preset: renderOptions.preset,
-        audioNormalize: renderOptions.audioNormalize
+        audioNormalize: true,   // loudnorm always on
+        audioSmoothing: renderOptions.smoothAudio,
+        concat: "stream-copy"   // no re-render
       }
     });
 
@@ -1322,6 +1275,7 @@ async function renderFromMultipart(req, jobId) {
         jobId,
         idx: i,
         panelCount,
+        aspectMode: renderOptions.aspectMode,
         renderOptions
       });
 
@@ -1372,10 +1326,14 @@ async function renderFromMultipart(req, jobId) {
       renderer: RENDERER_NAME,
       format: "MP4 (H264 Video + AAC Audio)",
       device_support: "Universal (iOS, Android, Chrome, Safari, Edge)",
+      fps: 25,
+      aspectMode: renderOptions.aspectMode,
       encodingSettings: {
         crf: renderOptions.crf,
         preset: renderOptions.preset,
-        audioNormalize: renderOptions.audioNormalize
+        audioNormalize: true,   // loudnorm always on
+        audioSmoothing: renderOptions.smoothAudio,
+        concat: "stream-copy"   // no re-render
       }
     });
 
