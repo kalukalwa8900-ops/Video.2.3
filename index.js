@@ -94,11 +94,14 @@ app.use((_req, _res, next) => next());
 // Directories
 // ════════════════════════════════════════════════════════════════
 
-const UPLOADS_ROOT = path.join(__dirname, "uploads");
-const OUTPUT_ROOT  = path.join(__dirname, "output");
-const TEMP_ROOT    = path.join(__dirname, "temp");
+const UPLOADS_ROOT     = path.join(__dirname, "uploads");
+const VIDEOS_ROOT      = path.join(UPLOADS_ROOT, "videos");
+const WATERMARKS_ROOT  = path.join(UPLOADS_ROOT, "watermarks");
+const IMAGES_ROOT      = path.join(UPLOADS_ROOT, "images");
+const OUTPUT_ROOT      = path.join(__dirname, "output");
+const TEMP_ROOT        = path.join(__dirname, "temp");
 
-[UPLOADS_ROOT, OUTPUT_ROOT, TEMP_ROOT].forEach(d => {
+[UPLOADS_ROOT, VIDEOS_ROOT, WATERMARKS_ROOT, IMAGES_ROOT, OUTPUT_ROOT, TEMP_ROOT].forEach(d => {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 });
 
@@ -153,6 +156,41 @@ function wrapText(text, maxW = 44) {
 
 function cleanupFiles(files = []) {
   for (const f of files) { try { fs.unlinkSync(f); } catch (_) {} }
+}
+
+function normalizeFfmpegPath(p) {
+  return p ? String(p).replace(/\\/g, "/") : p;
+}
+
+function parseMaybeJson(v, fallback = {}) {
+  if (!v) return fallback;
+  if (typeof v === "object") return v;
+  try { return JSON.parse(String(v)); } catch (_) { return fallback; }
+}
+
+function isValidWatermarkFile(file) {
+  const mime = String(file?.mimetype || "").toLowerCase();
+  const ext = path.extname(file?.originalname || file?.filename || "").toLowerCase();
+  return ["image/png", "image/jpeg", "image/jpg", "image/webp"].includes(mime) || [".png", ".jpg", ".jpeg", ".webp"].includes(ext);
+}
+
+function isValidVideoFile(file) {
+  const mime = String(file?.mimetype || "").toLowerCase();
+  const ext = path.extname(file?.originalname || file?.filename || "").toLowerCase();
+  return mime.startsWith("video/") || [".mp4", ".mov", ".m4v", ".webm", ".mkv"].includes(ext);
+}
+
+function logUploadedFiles(req) {
+  const summary = {};
+  for (const [field, files] of Object.entries(req.files || {})) {
+    summary[field] = (files || []).map(f => ({
+      originalname: f.originalname,
+      mimetype: f.mimetype,
+      size: f.size,
+      path: normalizeFfmpegPath(f.path),
+    }));
+  }
+  console.log("[upload] req.files:", JSON.stringify(summary, null, 2));
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -355,29 +393,37 @@ function buildWatermarkFilter(opts = {}) {
 // Extract render options from request body
 // ════════════════════════════════════════════════════════════════
 
-function extractRenderOptions(body) {
+function extractRenderOptions(body = {}) {
+  const payload = parseMaybeJson(body.payload, {});
+  const overlayMeta = parseMaybeJson(body.overlayMeta || body.overlay, payload.overlay || {});
+  const merged = { ...payload, ...body };
+  const sizePct = overlayMeta.sizePct ?? overlayMeta.size_pct;
+  const opacity = overlayMeta.opacity;
+  const marginPx = overlayMeta.marginPx ?? overlayMeta.margin_px;
+  const position = overlayMeta.position;
+
   return {
     // Encoding
-    crf:           Math.max(18, Math.min(32, parseInt(body.crf)  || RC.CRF)),
-    preset:        body.preset        || RC.PRESET,
-    audioBitrate:  body.audioBitrate  || RC.AUDIO_BITRATE,
-    pixFmt:        body.pixFmt        || RC.PIX_FMT,
-    videoCodec:    body.videoCodec    || "libx264",
-    movflags:      body.movflags      || RC.MOVFLAGS,
-    maxrate:       body.maxrate       || "",
-    bufsize:       body.bufsize       || "",
+    crf:           Math.max(18, Math.min(32, parseInt(merged.crf)  || RC.CRF)),
+    preset:        merged.preset        || RC.PRESET,
+    audioBitrate:  merged.audioBitrate  || RC.AUDIO_BITRATE,
+    pixFmt:        merged.pixFmt        || RC.PIX_FMT,
+    videoCodec:    merged.videoCodec    || "libx264",
+    movflags:      merged.movflags      || RC.MOVFLAGS,
+    maxrate:       merged.maxrate       || "",
+    bufsize:       merged.bufsize       || "",
     // Aspect
-    aspectMode:    body.aspectMode || body.aspect_mode || "fit",
+    aspectMode:    merged.aspectMode || merged.aspect_mode || "fit",
     // Audio processing
-    audioNormalize: body.audioNormalize === true || body.audioNormalize === "true",
-    loudnorm:       body.loudnorm       === true || body.loudnorm       === "true",
-    smoothAudio:    body.smoothAudio    === true || body.smoothAudio    === "true",
+    audioNormalize: merged.audioNormalize === true || merged.audioNormalize === "true" || merged.audio_normalize === true || merged.audio_normalize === "true",
+    loudnorm:       merged.loudnorm       === true || merged.loudnorm       === "true",
+    smoothAudio:    merged.smoothAudio    === true || merged.smoothAudio    === "true",
     // Watermark
     watermarkFile: null,  // filled by route handlers when a file is uploaded
-    wmPosition:    body.wmPosition || body.watermark_position || RC.WM_POSITION,
-    wmOpacity:     parseFloat(body.wmOpacity  || body.watermark_opacity || RC.WM_OPACITY),
-    wmScale:       parseFloat(body.wmScale    || body.watermark_scale   || RC.WM_SCALE),
-    wmMargin:      parseInt  (body.wmMargin   || body.watermark_margin  || RC.WM_MARGIN),
+    wmPosition:    position || merged.wmPosition || merged.watermark_position || RC.WM_POSITION,
+    wmOpacity:     Math.max(0, Math.min(1, parseFloat(opacity ?? merged.wmOpacity ?? merged.watermark_opacity ?? RC.WM_OPACITY))),
+    wmScale:       Math.max(0.03, Math.min(0.5, parseFloat(merged.wmScale ?? merged.watermark_scale ?? (Number(sizePct || 0) ? Number(sizePct) / 100 : RC.WM_SCALE)))),
+    wmMargin:      Math.max(0, parseInt(marginPx ?? merged.wmMargin ?? merged.watermark_margin ?? RC.WM_MARGIN)),
   };
 }
 
@@ -521,23 +567,29 @@ function spawnFfmpeg(args, desc = "") {
 // ════════════════════════════════════════════════════════════════
 
 async function applyWatermark(inputPath, watermarkPath, outputPath, renderOptions = {}) {
-  if (!watermarkPath || !fs.existsSync(watermarkPath)) {
-    console.log("[watermark] no watermark file — skipping");
-    fs.copyFileSync(inputPath, outputPath);
-    return;
+  const videoPath = normalizeFfmpegPath(inputPath);
+  const wmPath = normalizeFfmpegPath(watermarkPath);
+  console.log("VIDEO:", videoPath);
+  console.log("WATERMARK:", wmPath);
+
+  if (!wmPath || !fs.existsSync(wmPath)) {
+    throw new Error("Watermark image missing");
+  }
+  if (!videoPath || !fs.existsSync(videoPath)) {
+    throw new Error("Video input missing");
   }
 
-  console.log(`[watermark] applying ${path.basename(watermarkPath)} → ${path.basename(outputPath)}`);
+  console.log(`[watermark] applying ${path.basename(wmPath)} → ${path.basename(outputPath)}`);
   const wm  = buildWatermarkFilter(renderOptions);
   const crf = renderOptions.crf || RC.CRF;
 
   await spawnFfmpeg([
-    "-i", inputPath,
-    "-i", watermarkPath,
+    "-i", videoPath,
+    "-i", wmPath,
     "-filter_complex",
-    `[1:v]${wm.wmScale},${wm.overlay}[wm];[0:v][wm]overlay=${wm.position}[vout]`,
+    `[1:v]${wm.wmScale},${wm.overlay}[wm];[0:v][wm]overlay=${wm.position}:format=auto[vout]`,
     "-map", "[vout]",
-    "-map", "0:a",
+    "-map", "0:a?",
     "-c:v", "libx264",
     "-pix_fmt", RC.PIX_FMT,
     "-crf",  String(crf),
@@ -818,7 +870,8 @@ async function runRenderLoop({ jobId, panels, getImage, getAudio, getText, getDu
 // ════════════════════════════════════════════════════════════════
 
 async function renderFromProject(req, jobId) {
-  const projectId  = safeName(req.body.project_id || req.body.projectId, "");
+  const body = { ...parseMaybeJson(req.body?.payload, {}), ...(req.body || {}) };
+  const projectId  = safeName(body.project_id || body.projectId, "");
   if (!projectId) return updateJob(jobId, { status: "error", error: "Missing project_id" });
 
   const projectDir = path.join(UPLOADS_ROOT, projectId);
@@ -826,14 +879,23 @@ async function renderFromProject(req, jobId) {
     return updateJob(jobId, { status: "error", error: `No panels found for project_id ${projectId}` });
   }
 
-  const renderOptions  = extractRenderOptions(req.body);
-  const batchIndex     = Number(req.body.batchIndex   || req.body.batch_index   || 0);
-  const totalBatches   = Number(req.body.totalBatches || req.body.total_batches || 1);
+  const renderOptions  = extractRenderOptions(body);
+  const batchIndex     = Number(body.batchIndex   || body.batch_index   || 0);
+  const totalBatches   = Number(body.totalBatches || body.total_batches || 1);
+
+  const wmFile = req.files?.watermark?.[0];
+  if (wmFile) {
+    if (!isValidWatermarkFile(wmFile)) {
+      cleanupFiles([wmFile.path]);
+      return updateJob(jobId, { status: "error", error: "Invalid watermark file. Use PNG, JPEG, or WebP." });
+    }
+    renderOptions.watermarkFile = normalizeFfmpegPath(wmFile.path);
+  }
 
   let orderedRefs = [];
   try {
-    if (Array.isArray(req.body.panels))         orderedRefs = req.body.panels;
-    else if (typeof req.body.panels === "string") orderedRefs = JSON.parse(req.body.panels);
+    if (Array.isArray(body.panels))         orderedRefs = body.panels;
+    else if (typeof body.panels === "string") orderedRefs = JSON.parse(body.panels);
   } catch (_) { orderedRefs = []; }
 
   const readPanel = (panelId, fi) => {
@@ -880,9 +942,15 @@ async function renderFromMultipart(req, jobId) {
   const totalBatches  = Number(req.body.totalBatches || 1);
   const uploadPaths   = imageFiles.map(f => f.path);
 
-  // Watermark file (uploaded in this request)
-  const wmFiles = req.files?.watermark || [];
-  if (wmFiles.length) renderOptions.watermarkFile = wmFiles[0].path;
+  // Watermark file (uploaded in this request). Use req.files.watermark[0], never req.file.
+  const wmFile = req.files?.watermark?.[0];
+  if (wmFile) {
+    if (!isValidWatermarkFile(wmFile)) {
+      cleanupFiles([wmFile.path, ...uploadPaths]);
+      return updateJob(jobId, { status: "error", error: "Invalid watermark file. Use PNG, JPEG, or WebP." });
+    }
+    renderOptions.watermarkFile = normalizeFfmpegPath(wmFile.path);
+  }
 
   const lines = String(req.body.narration || "").split("\n").map(l => l.trim());
   while (lines.length < imageFiles.length) lines.push("");
@@ -908,16 +976,34 @@ async function renderFromMultipart(req, jobId) {
 
 function makeDiskStorage(dest) {
   return multer.diskStorage({
-    destination: dest,
+    destination: (_req, file, cb) => {
+      const field = String(file.fieldname || "");
+      let finalDest = dest;
+      if (field === "video") finalDest = VIDEOS_ROOT;
+      else if (field === "watermark") finalDest = WATERMARKS_ROOT;
+      else if (field === "images" || field === "image") finalDest = IMAGES_ROOT;
+      fs.mkdirSync(finalDest, { recursive: true });
+      cb(null, finalDest);
+    },
     filename: (_req, file, cb) => {
-      const ext = path.extname(file.originalname).toLowerCase() || ".bin";
+      const ext = path.extname(file.originalname).toLowerCase() || extFor(file, ".bin");
       cb(null, `${Date.now()}_${crypto.randomBytes(4).toString("hex")}${ext}`);
     },
   });
 }
 
-const panelUpload = multer({ storage: makeDiskStorage(UPLOADS_ROOT), limits: { fileSize: 500 * 1024 * 1024, files: 4 } });
-const diskUpload  = multer({ storage: makeDiskStorage(UPLOADS_ROOT), limits: { fileSize: 300 * 1024 * 1024, files: 3000 } });
+function uploadFileFilter(_req, file, cb) {
+  if (file.fieldname === "watermark" && !isValidWatermarkFile(file)) {
+    return cb(new multer.MulterError("LIMIT_UNEXPECTED_FILE", "watermark"));
+  }
+  if (file.fieldname === "video" && !isValidVideoFile(file)) {
+    return cb(new multer.MulterError("LIMIT_UNEXPECTED_FILE", "video"));
+  }
+  cb(null, true);
+}
+
+const panelUpload = multer({ storage: makeDiskStorage(UPLOADS_ROOT), fileFilter: uploadFileFilter, limits: { fileSize: 500 * 1024 * 1024, files: 4 } });
+const diskUpload  = multer({ storage: makeDiskStorage(UPLOADS_ROOT), fileFilter: uploadFileFilter, limits: { fileSize: 300 * 1024 * 1024, files: 3000 } });
 const zipUpload   = multer({ storage: makeDiskStorage(TEMP_ROOT),    limits: { fileSize: 500 * 1024 * 1024, files: 1 } });
 
 // ════════════════════════════════════════════════════════════════
@@ -1064,25 +1150,18 @@ app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
 // ── Main render route ────────────────────────────────────────────
 //
 // Accepts:
-//   POST /render  { project_id }         → project-panel workflow
-//   POST /render  multipart images[]     → direct-upload workflow
+//   POST /render  JSON { project_id }                              → project-panel workflow, no watermark file
+//   POST /render  multipart project_id + watermark                 → project-panel workflow with watermark file
+//   POST /render  multipart video + watermark                      → direct video watermark workflow
+//   POST /render  multipart images[] + optional watermark          → direct image workflow
 //
-// Watermark: upload a PNG as `watermark` field in the multipart form.
-// Options (all optional):
-//   aspectMode     = "fit" | "cinematic"
-//   audioNormalize = true/false
-//   smoothAudio    = true/false
-//   crf            = 18–32  (default 26)
-//   preset         = veryfast / fast / medium
-//   wmPosition     = bottom-right / bottom-left / top-right / top-left / center
-//   wmOpacity      = 0.0–1.0  (default 0.2)
-//   wmScale        = 0.05–0.5 (default 0.15)
-//   wmMargin       = pixels   (default 20)
+// IMPORTANT: multipart fields MUST be parsed by multer before reading req.body.
+// Watermark file field name is exactly `watermark`; direct video field is exactly `video`.
 
 app.post("/render", (req, res) => {
-  const hasProject = req.body?.project_id || req.body?.projectId;
+  const contentType = String(req.headers["content-type"] || "").toLowerCase();
 
-  if (hasProject) {
+  const startProjectJob = () => {
     const jobId = createJob();
     res.json({ success: true, jobId, status: "queued" });
     setImmediate(() =>
@@ -1092,14 +1171,68 @@ app.post("/render", (req, res) => {
         scheduleJobEviction(jobId);
       })
     );
-    return;
+  };
+
+  if (!contentType.includes("multipart/form-data")) {
+    return startProjectJob();
   }
 
   diskUpload.fields([
-    { name: "images",    maxCount: 2000 },
+    { name: "video",     maxCount: 1 },
     { name: "watermark", maxCount: 1 },
+    { name: "images",    maxCount: 2000 },
   ])(req, res, multerErr => {
-    if (multerErr) return res.status(400).json({ success: false, error: multerErr.message });
+    if (multerErr) {
+      console.error("[upload] multer error:", multerErr);
+      return res.status(400).json({ success: false, error: multerErr.field ? `Invalid upload field or file type: ${multerErr.field}` : multerErr.message });
+    }
+
+    logUploadedFiles(req);
+
+    const body = { ...parseMaybeJson(req.body?.payload, {}), ...(req.body || {}) };
+    const hasProject = body.project_id || body.projectId;
+    const videoFile = req.files?.video?.[0];
+    const watermarkFile = req.files?.watermark?.[0];
+
+    if (watermarkFile && !fs.existsSync(watermarkFile.path)) {
+      return res.status(400).json({ success: false, error: "Watermark image missing" });
+    }
+    if (videoFile && !fs.existsSync(videoFile.path)) {
+      return res.status(400).json({ success: false, error: "Video file missing" });
+    }
+
+    if (hasProject) return startProjectJob();
+
+    if (videoFile) {
+      if (!watermarkFile) return res.status(400).json({ success: false, error: "Watermark image missing" });
+      const jobId = createJob();
+      res.json({ success: true, jobId, status: "queued" });
+      setImmediate(async () => {
+        const renderOptions = extractRenderOptions(body);
+        const videoPath = normalizeFfmpegPath(videoFile.path);
+        const watermarkPath = normalizeFfmpegPath(watermarkFile.path);
+        const finalPath = path.join(OUTPUT_ROOT, `${jobId}_final.mp4`);
+        try {
+          renderOptions.watermarkFile = watermarkPath;
+          console.log("VIDEO:", videoPath);
+          console.log("WATERMARK:", watermarkPath);
+          await applyWatermark(videoPath, watermarkPath, finalPath, renderOptions);
+          cleanupFiles([videoPath, watermarkPath]);
+          const host = `https://${process.env.RAILWAY_PUBLIC_DOMAIN || "localhost"}`;
+          const url = `${host}/output/${jobId}_final.mp4`;
+          setTimeout(() => { try { fs.unlinkSync(finalPath); } catch (_) {} }, RC.FILE_TTL_MS);
+          updateJob(jobId, { status: "done", progress: 100, url, videoUrl: url, video_url: url, watermark: true });
+          scheduleJobEviction(jobId);
+        } catch (err) {
+          cleanupFiles([videoPath, watermarkPath, finalPath]);
+          console.error(`[${jobId}] ❌ video watermark error:`, err.message);
+          updateJob(jobId, { status: "error", error: err.message });
+          scheduleJobEviction(jobId);
+        }
+      });
+      return;
+    }
+
     const jobId = createJob();
     res.json({ success: true, jobId, status: "queued" });
     setImmediate(() =>
