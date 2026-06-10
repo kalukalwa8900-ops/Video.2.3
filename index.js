@@ -29,13 +29,13 @@ const RC = {
   AUDIO_BITRATE: "128k",
   MOVFLAGS:      "+faststart",
 
-  // Ken-Burns internal fps (zoompan is expensive; keep it low)
-  ZOOMPAN_FPS:   15,
+  // Ken-Burns internal fps — 24 for smooth anime-style motion
+  ZOOMPAN_FPS:   24,
 
-  // Zoom — subtle, cinematic, never aggressive
-  ZOOM_AMOUNT:   1.02,        // 2 % extra headroom for pan/zoom
-  PAN_PIXELS:    8,           // pixel offset for slide effects
-  PAN_PIXELS_Y:  5,
+  // Zoom — strong enough to be visible, cinematic
+  ZOOM_AMOUNT:   1.10,        // 10 % zoom — clearly visible cinematic motion
+  PAN_PIXELS:    30,          // larger pan offset for visible slide movement
+  PAN_PIXELS_Y:  20,
 
   // Concat
   BATCH_SIZE:    50,          // segments per batch in recursive merge
@@ -292,10 +292,11 @@ function validateSegment(segPath) {
 // ════════════════════════════════════════════════════════════════
 //
 // FIT MODE     — full image visible, black letterbox, no zoompan
-// CINEMATIC    — 2% zoom + gentle pan; internal fps = RC.ZOOMPAN_FPS
+// CINEMATIC    — 10% zoom + strong pan; internal fps = RC.ZOOMPAN_FPS
 //
-// All zoompan uses RC.ZOOM_AMOUNT (1.02) and tiny pixel offsets to avoid
-// aggressive crop while still providing subtle motion.
+// Correct filter order: scale → zoompan → format
+// zoompan operates AFTER scale so it works on the final WxH frame.
+// No -r output override — zoompan fps= controls output rate internally.
 // ════════════════════════════════════════════════════════════════
 
 function buildScaleFilter() {
@@ -305,42 +306,53 @@ function buildScaleFilter() {
 }
 
 function getKenBurnsFilter(idx, duration, panelCount, aspectMode) {
-  const fps    = RC.ZOOMPAN_FPS;
+  const fps    = RC.ZOOMPAN_FPS;                           // 24 — smooth motion
   const frames = Math.max(1, Math.ceil(duration * fps));
-  const z      = RC.ZOOM_AMOUNT;
-  const px     = RC.PAN_PIXELS;
-  const py     = RC.PAN_PIXELS_Y;
+  const z      = RC.ZOOM_AMOUNT;                           // 1.10
+  const px     = RC.PAN_PIXELS;                            // 30px
+  const py     = RC.PAN_PIXELS_Y;                          // 20px
   const WH     = `${RC.W}x${RC.H}`;
   const scale  = buildScaleFilter();
 
   const mode = String(aspectMode || "fit").toLowerCase().trim();
 
   if (mode !== "cinematic") {
-    // FIT: no zoompan at all — just scale+pad+setsar, no motion
+    // FIT: no zoompan — scale + pad only, no motion
     return scale;
   }
 
-  // CINEMATIC: subtle motion — pick one of 5 patterns round-robin
-  // We scale first (lightweight), then apply zoompan on the already-scaled stream.
-  // zoompan operates on the padded 1280×720 frame so it never crops outside the image.
+  // CINEMATIC: strong visible motion — 5 patterns round-robin
+  // Order: scale → zoompan → format=yuv420p
+  // zoompan x/y keep image centred while zoom/pan progresses.
+
+  // Safe centre expressions — prevent going out of bounds
   const cx = `iw/2-(iw/zoom/2)`;
   const cy = `ih/2-(ih/zoom/2)`;
 
+  // Pan clamping helpers — stay within zoompan's legal range
+  const maxX = `iw-(iw/zoom)`;
+  const maxY = `ih-(ih/zoom)`;
+
   const patterns = [
-    // 0: gentle zoom-in from centre
-    `zoompan=z='min(zoom+0.0004,${z})':x='${cx}':y='${cy}':d=${frames}:s=${WH}:fps=${fps}`,
-    // 1: gentle zoom-out from centre
-    `zoompan=z='if(lte(on,1),${z},max(zoom-0.0004,1.0))':x='${cx}':y='${cy}':d=${frames}:s=${WH}:fps=${fps}`,
-    // 2: subtle left-to-right pan
-    `zoompan=z='${z}':x='min(${cx}+(on*${px}/${frames}),iw-iw/zoom)':y='${cy}':d=${frames}:s=${WH}:fps=${fps}`,
-    // 3: subtle right-to-left pan
-    `zoompan=z='${z}':x='max(${cx}-(on*${px}/${frames}),0)':y='${cy}':d=${frames}:s=${WH}:fps=${fps}`,
-    // 4: subtle up pan
-    `zoompan=z='${z}':x='${cx}':y='max(${cy}-(on*${py}/${frames}),0)':d=${frames}:s=${WH}:fps=${fps}`,
+    // 0: zoom-in from centre (1.0 → z)
+    `zoompan=z='min(1+on*(${z}-1)/${frames},${z})':x='${cx}':y='${cy}':d=${frames}:s=${WH}:fps=${fps}`,
+
+    // 1: zoom-out from z → 1.0
+    `zoompan=z='max(${z}-on*(${z}-1)/${frames},1.001)':x='${cx}':y='${cy}':d=${frames}:s=${WH}:fps=${fps}`,
+
+    // 2: zoom-in + pan left-to-right
+    `zoompan=z='min(1+on*(${z}-1)/${frames},${z})':x='min(on*${px}/${frames},${maxX})':y='${cy}':d=${frames}:s=${WH}:fps=${fps}`,
+
+    // 3: zoom-in + pan right-to-left
+    `zoompan=z='min(1+on*(${z}-1)/${frames},${z})':x='max(${maxX}-on*${px}/${frames},0)':y='${cy}':d=${frames}:s=${WH}:fps=${fps}`,
+
+    // 4: zoom-in + pan top-to-bottom (downward reveal)
+    `zoompan=z='min(1+on*(${z}-1)/${frames},${z})':x='${cx}':y='min(on*${py}/${frames},${maxY})':d=${frames}:s=${WH}:fps=${fps}`,
   ];
 
   const chosenPan = patterns[idx % patterns.length];
-  return `${scale},${chosenPan}`;
+  // Correct order: scale → zoompan → format (no pad between zoompan and format)
+  return `${scale},${chosenPan},format=yuv420p`;
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -475,7 +487,7 @@ function createSegment({ imagePath, audioPath, text, duration, outPath,
       `-vf ${vfParts.join(",")}`,
       `-c:v ${renderOptions.videoCodec || "libx264"}`,
       `-pix_fmt ${renderOptions.pixFmt || RC.PIX_FMT}`,
-      `-r ${fps}`,
+      // NOTE: no -r override — zoompan controls FPS internally via its fps= param
       `-crf ${renderOptions.crf || RC.CRF}`,
       `-preset ${renderOptions.preset || RC.PRESET}`,
       `-threads ${RC.THREADS}`,
