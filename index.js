@@ -371,13 +371,12 @@ const zipUpload = multer({
 });
 
 // ================================
-// FPS: Always 25 for 1-500 images (broadcast standard, best quality)
+// FPS: Fixed at 15 — cinematic anime/manhua feeling, much faster render
 // ================================
 
 function getFps(panelCount) {
-  // Fixed at 25 fps for all panel counts (broadcast standard)
-  // Provides consistent smooth playback and best Ken Burns animation quality
-  return 25;
+  // 15fps: more visible motion per frame, anime/manhua style, ~40% faster encode
+  return 15;
 }
 
 // ================================
@@ -406,54 +405,53 @@ function calculateFitInFrame(imageAspectRatio, frameWidth = 1280, frameHeight = 
 }
 
 // ================================
-// Ken Burns Animation — zoom in/out + slide up/down/left/right
-// All at 25 fps, best quality, no cropping in fit mode
+// Ken Burns Animation — cinematic zoom in/out + slide left/right/up/down
+// 15fps · scale=2560 · zoom=1.18 · movement 10%–18% for alive anime feel
 // ================================
 
 function getKenBurnsFilter(idx, duration, panelCount = 1, aspectMode = "fit") {
-  const fps = 25; // Always 25 fps
+  const fps = 15; // Always 15fps
   const totalFrames = Math.ceil(duration * fps);
   const normalised = String(aspectMode || "fit").toLowerCase().trim();
 
   if (normalised === "fit") {
-    // FIT MODE — preserve full image, letterbox/pillarbox with black bars
-    // Gentle Ken Burns: 6 animations cycling across panels
+    // FIT MODE — full image visible, letterbox/pillarbox, strong Ken Burns
     const animations = [
-      // 1. Subtle zoom IN (100% → 108%)
-      `scale=8000:-1,zoompan=z='min(zoom+0.0003,1.08)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
-      // 2. Subtle zoom OUT (108% → 100%)
-      `scale=8000:-1,zoompan=z='if(lte(on,1),1.08,max(zoom-0.0003,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
-      // 3. Slide LEFT (pan right-to-left)
-      `scale=8000:-1,zoompan=z='1.06':x='if(lte(on,1),iw*0.04,min(x+iw*0.04/${totalFrames},iw*0.08))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
-      // 4. Slide RIGHT (pan left-to-right)
-      `scale=8000:-1,zoompan=z='1.06':x='if(lte(on,1),iw*0.08,max(x-iw*0.04/${totalFrames},0))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
-      // 5. Slide UP (pan bottom-to-top)
-      `scale=8000:-1,zoompan=z='1.06':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih*0.04,min(y+ih*0.03/${totalFrames},ih*0.07))':d=${totalFrames}:s=1280x720:fps=25,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
-      // 6. Slide DOWN (pan top-to-bottom)
-      `scale=8000:-1,zoompan=z='1.06':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih*0.07,max(y-ih*0.03/${totalFrames},0))':d=${totalFrames}:s=1280x720:fps=25,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+      // 1. Zoom IN (100% → 118%)
+      `scale=2560:-1,zoompan=z='min(zoom+0.0009,1.18)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+      // 2. Zoom OUT (118% → 100%)
+      `scale=2560:-1,zoompan=z='if(lte(on,1),1.18,max(zoom-0.0009,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+      // 3. Slide LEFT (pan 10% → 18%)
+      `scale=2560:-1,zoompan=z='1.18':x='if(lte(on,1),iw*0.10,min(x+iw*0.08/${totalFrames},iw*0.18))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+      // 4. Slide RIGHT (pan 18% → 10%)
+      `scale=2560:-1,zoompan=z='1.18':x='if(lte(on,1),iw*0.18,max(x-iw*0.08/${totalFrames},iw*0.10))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+      // 5. Slide UP (pan 8% → 16% vertical)
+      `scale=2560:-1,zoompan=z='1.18':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih*0.08,min(y+ih*0.08/${totalFrames},ih*0.16))':d=${totalFrames}:s=1280x720:fps=15,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+      // 6. Slide DOWN (pan 16% → 8% vertical)
+      `scale=2560:-1,zoompan=z='1.18':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih*0.16,max(y-ih*0.08/${totalFrames},ih*0.08))':d=${totalFrames}:s=1280x720:fps=15,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
     ];
     return animations[idx % animations.length];
 
   } else if (normalised === "cinematic") {
-    // CINEMATIC MODE — fill frame edge-to-edge, full Ken Burns suite
+    // CINEMATIC MODE — fill full frame, stronger zoom and movement
     const animations = [
       // 1. Zoom IN center
-      `scale=8000:-1,zoompan=z='min(zoom+0.0003,1.1)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,setsar=1`,
+      `scale=2560:-1,zoompan=z='min(zoom+0.0009,1.18)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,setsar=1`,
       // 2. Zoom OUT center
-      `scale=8000:-1,zoompan=z='if(lte(on,1),1.1,max(zoom-0.0003,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,setsar=1`,
+      `scale=2560:-1,zoompan=z='if(lte(on,1),1.18,max(zoom-0.0009,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,setsar=1`,
       // 3. Slide LEFT
-      `scale=8000:-1,zoompan=z='1.08':x='if(lte(on,1),0,min(x+iw*0.06/${totalFrames},iw*0.08))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,setsar=1`,
+      `scale=2560:-1,zoompan=z='1.18':x='if(lte(on,1),iw*0.10,min(x+iw*0.08/${totalFrames},iw*0.18))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,setsar=1`,
       // 4. Slide RIGHT
-      `scale=8000:-1,zoompan=z='1.08':x='if(lte(on,1),iw*0.08,max(x-iw*0.06/${totalFrames},0))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,setsar=1`,
+      `scale=2560:-1,zoompan=z='1.18':x='if(lte(on,1),iw*0.18,max(x-iw*0.08/${totalFrames},iw*0.10))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,setsar=1`,
       // 5. Slide UP
-      `scale=8000:-1,zoompan=z='1.08':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),0,min(y+ih*0.05/${totalFrames},ih*0.08))':d=${totalFrames}:s=1280x720:fps=25,setsar=1`,
+      `scale=2560:-1,zoompan=z='1.18':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih*0.08,min(y+ih*0.08/${totalFrames},ih*0.16))':d=${totalFrames}:s=1280x720:fps=15,setsar=1`,
       // 6. Slide DOWN
-      `scale=8000:-1,zoompan=z='1.08':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih*0.08,max(y-ih*0.05/${totalFrames},0))':d=${totalFrames}:s=1280x720:fps=25,setsar=1`,
+      `scale=2560:-1,zoompan=z='1.18':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih*0.16,max(y-ih*0.08/${totalFrames},ih*0.08))':d=${totalFrames}:s=1280x720:fps=15,setsar=1`,
     ];
     return animations[idx % animations.length];
   }
 
-  // Default: FIT with static scale (no animation, fastest)
+  // Default: static fit (fastest, no animation)
   return `scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`;
 }
 
@@ -520,7 +518,7 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
     const cmd = ffmpeg()
       .setFfmpegPath(FFMPEG_PATH)
       .input(imagePath)
-      .inputOptions(["-loop 1", "-framerate 25"]);  // ← 25fps input for smooth zoompan
+      .inputOptions(["-loop 1", "-framerate 15"]);  // ← 15fps input matches output
 
     if (hasAudio) {
       cmd.input(audioPath);
@@ -530,29 +528,26 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
         .inputOptions(["-f lavfi"]);
     }
 
-    // Best quality encoding settings (stable, no quality loss)
+    // Speed-optimised quality settings
     const videoCodec   = renderOptions.videoCodec  || "libx264";
     const pixFmt       = renderOptions.pixFmt       || "yuv420p";
-    const crf          = Math.max(18, Math.min(23, parseInt(renderOptions.crf) || 20)); // ← CRF 20 = best quality
-    const preset       = renderOptions.preset        || "medium";  // ← medium = better quality than fast
+    const crf          = Math.max(18, Math.min(26, parseInt(renderOptions.crf) || 21)); // CRF 21
+    const preset       = renderOptions.preset        || "faster"; // faster > medium for speed
     const maxrate      = renderOptions.maxrate        || "";
     const bufsize      = renderOptions.bufsize        || "";
     const audioBitrate = renderOptions.audioBitrate   || "192k";
     const movflags     = renderOptions.movflags ? String(renderOptions.movflags) : "+faststart";
 
-    // Always apply loudnorm for stable volume across all segments
-    const audioFilter = "loudnorm=I=-16:TP=-1.5:LRA=11";
-
+    // No loudnorm — removed for speed; audio passed through clean
     const outputOpts = [
-      `-af ${audioFilter}`,
       `-vf ${vfParts.join(",")}`,
       `-c:v ${videoCodec}`,
       `-pix_fmt ${pixFmt}`,
-      `-r 25`,           // ← Always 25 fps output
-      `-g 50`,           // ← GOP size = 2× fps for clean seeking
+      `-r 15`,           // ← 15 fps output
+      `-g 30`,           // ← GOP = 2× fps for clean seeking
       `-crf ${crf}`,
       `-preset ${preset}`,
-      `-threads 4`,
+      `-threads 0`,      // ← Let FFmpeg use all available CPU cores
       `-movflags ${movflags}`,
       `-c:a aac`,
       `-b:a ${audioBitrate}`,
@@ -673,7 +668,7 @@ function spawnFfmpeg(args, description = "") {
 
 // ================================
 // CONCAT — Lossless stream-copy (no re-render, no quality loss, instant)
-// All segments are already encoded at 25fps/CRF-20; just join them.
+// Segments already encoded at 15fps/CRF-21; just join them.
 // ================================
 
 async function concatWithTransitions(segPaths, durations, outPath, renderOptions = {}) {
@@ -1001,12 +996,9 @@ app.post("/render", (req, res) => {
     return;
   }
 
-  // FIX: Change from .array() to .fields() to support overlay, watermark, etc.
+  // Images only — watermark/overlay removed for stability
   diskUpload.fields([
-    { name: "images", maxCount: 2000 },
-    { name: "overlay", maxCount: 1 },
-    { name: "overlayLogo", maxCount: 1 },
-    { name: "watermark", maxCount: 1 }
+    { name: "images", maxCount: 2000 }
   ])(req, res, (multerErr) => {
     if (multerErr) {
       console.error("[/render] Multer error:", multerErr.message);
@@ -1027,32 +1019,27 @@ app.post("/render", (req, res) => {
 });
 
 // ================================
-// ENHANCEMENT 3: Extract render options from payload
+// Extract render options from payload
 // ================================
 
 function extractRenderOptions(body) {
   return {
-    audioNormalize: body.audioNormalize === true || body.audioNormalize === "true",
-    loudnorm: body.loudnorm === true || body.loudnorm === "true",
-    smoothAudio: body.smoothAudio === true || body.smoothAudio === "true",
-    crf: body.crf || 23,
-    preset: body.preset || "fast",
-    maxrate: body.maxrate || "",
-    bufsize: body.bufsize || "",
-    audioBitrate: body.audioBitrate || "192k",
-    movflags: body.movflags || "+faststart",
-    pixFmt: body.pixFmt || "yuv420p",
-    videoCodec: body.videoCodec || "libx264",
-    overlay: body.overlay === true || body.overlay === "true",
-    overlayLogo: body.overlayLogo || null,
-    watermark: body.watermark || null,
-    zoom: body.zoom || null,
-    zoomFactor: body.zoomFactor || 1.0,
-    cropX: body.cropX || null,
-    cropY: body.cropY || null,
-    focusX: body.focusX || 0.5,
-    focusY: body.focusY || 0.5,
-    aspectMode: body.aspectMode || body.aspect_mode || "fit"  // ← Default to "fit" for proper aspect ratio
+    smoothAudio:   body.smoothAudio === true || body.smoothAudio === "true",
+    crf:           body.crf || 21,
+    preset:        body.preset || "faster",
+    maxrate:       body.maxrate || "",
+    bufsize:       body.bufsize || "",
+    audioBitrate:  body.audioBitrate || "192k",
+    movflags:      body.movflags || "+faststart",
+    pixFmt:        body.pixFmt || "yuv420p",
+    videoCodec:    body.videoCodec || "libx264",
+    zoom:          body.zoom || null,
+    zoomFactor:    body.zoomFactor || 1.0,
+    cropX:         body.cropX || null,
+    cropY:         body.cropY || null,
+    focusX:        body.focusX || 0.5,
+    focusY:        body.focusY || 0.5,
+    aspectMode:    body.aspectMode || body.aspect_mode || "fit"
   };
 }
 
@@ -1204,14 +1191,12 @@ async function renderFromProject(req, jobId) {
       renderer: RENDERER_NAME,
       format: "MP4 (H264 Video + AAC Audio)",
       device_support: "Universal (iOS, Android, Chrome, Safari, Edge)",
-      fps: 25,
+      fps: 15,
       aspectMode: renderOptions.aspectMode,
       encodingSettings: {
         crf: renderOptions.crf,
         preset: renderOptions.preset,
-        audioNormalize: true,   // loudnorm always on
-        audioSmoothing: renderOptions.smoothAudio,
-        concat: "stream-copy"   // no re-render
+        concat: "stream-copy"
       }
     });
 
@@ -1326,14 +1311,12 @@ async function renderFromMultipart(req, jobId) {
       renderer: RENDERER_NAME,
       format: "MP4 (H264 Video + AAC Audio)",
       device_support: "Universal (iOS, Android, Chrome, Safari, Edge)",
-      fps: 25,
+      fps: 15,
       aspectMode: renderOptions.aspectMode,
       encodingSettings: {
         crf: renderOptions.crf,
         preset: renderOptions.preset,
-        audioNormalize: true,   // loudnorm always on
-        audioSmoothing: renderOptions.smoothAudio,
-        concat: "stream-copy"   // no re-render
+        concat: "stream-copy"
       }
     });
 
