@@ -1,517 +1,419 @@
 const express = require("express");
-const multer = require("multer");
-const cors = require("cors");
-const ffmpeg = require("fluent-ffmpeg");
-const path = require("path");
-const fs = require("fs");
-const crypto = require("crypto");
+const multer  = require("multer");
+const cors    = require("cors");
+const ffmpeg  = require("fluent-ffmpeg");
+const path    = require("path");
+const fs      = require("fs");
+const crypto  = require("crypto");
 const { execSync, spawn } = require("child_process");
-const AdmZip = require("adm-zip");
+const AdmZip  = require("adm-zip");
 
-const app = express();
-const PORT = process.env.PORT || 8080;
+const app          = express();
+const PORT         = process.env.PORT || 8080;
 const RENDERER_NAME = process.env.RENDERER_NAME || "renderer";
 
-// ================================
-// FFmpeg Detection & Validation
-// ================================
+// ════════════════════════════════════════════════════════════════
+// RENDER CONSTANTS — tune here, apply everywhere
+// ════════════════════════════════════════════════════════════════
+
+const RC = {
+  // Output resolution
+  W: 1280,
+  H: 720,
+
+  // Encoding — optimised for speed vs. quality on 1-CPU Railway containers
+  PRESET:        "veryfast",
+  CRF:           26,          // 24-28 sweet-spot; lower = better quality / bigger file
+  THREADS:       1,           // 1 thread = stable RAM; no parallelism fighting itself
+  PIX_FMT:       "yuv420p",
+  AUDIO_BITRATE: "128k",
+  MOVFLAGS:      "+faststart",
+
+  // Ken-Burns internal fps (zoompan is expensive; keep it low)
+  ZOOMPAN_FPS:   15,
+
+  // Zoom — subtle, cinematic, never aggressive
+  ZOOM_AMOUNT:   1.02,        // 2 % extra headroom for pan/zoom
+  PAN_PIXELS:    8,           // pixel offset for slide effects
+  PAN_PIXELS_Y:  5,
+
+  // Concat
+  BATCH_SIZE:    50,          // segments per batch in recursive merge
+  XFADE_MAX:     12,          // use xfade only for ≤ 12 clips
+  XFADE_DUR:     0.5,         // seconds of crossfade
+
+  // Watermark defaults
+  WM_POSITION:   "bottom-right",
+  WM_MARGIN:     20,
+  WM_OPACITY:    0.2,
+  WM_SCALE:      0.15,        // fraction of frame width
+
+  // Segment retry
+  MAX_RETRIES:   2,
+
+  // Job eviction
+  JOB_TTL_MS:    3 * 60 * 60 * 1000,
+  FILE_TTL_MS:   2 * 60 * 60 * 1000,
+  CLEANUP_INT:   30 * 60 * 1000,
+};
+
+// ════════════════════════════════════════════════════════════════
+// FFmpeg detection
+// ════════════════════════════════════════════════════════════════
 
 function validateFFmpegInstallation() {
-  const possiblePaths = [
-    "/usr/bin/ffmpeg",
-    "/usr/local/bin/ffmpeg",
-    "/opt/ffmpeg/bin/ffmpeg",
-    "ffmpeg"
-  ];
-
-  let foundPath = null;
-  for (const ffmpegPath of possiblePaths) {
+  const candidates = ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/ffmpeg/bin/ffmpeg", "ffmpeg"];
+  for (const p of candidates) {
     try {
-      const result = execSync(`${ffmpegPath} -version 2>&1`, { encoding: "utf-8" });
-      if (result.includes("ffmpeg version")) {
-        foundPath = ffmpegPath;
-        console.log(`✓ FFmpeg found at: ${ffmpegPath}`);
-        break;
-      }
-    } catch (e) {
-      continue;
-    }
+      const r = execSync(`${p} -version 2>&1`, { encoding: "utf-8" });
+      if (r.includes("ffmpeg version")) { console.log(`✓ FFmpeg: ${p}`); return p; }
+    } catch (_) {}
   }
-
-  if (!foundPath) {
-    console.error("❌ CRITICAL: FFmpeg is NOT installed!");
-    process.exit(1);
-  }
-
-  return foundPath;
+  console.error("❌ CRITICAL: FFmpeg not installed"); process.exit(1);
 }
 
-const FFMPEG_PATH = validateFFmpegInstallation();
+const FFMPEG_PATH  = validateFFmpegInstallation();
 const FFPROBE_PATH = FFMPEG_PATH.replace("ffmpeg", "ffprobe");
-
 ffmpeg.setFfmpegPath(FFMPEG_PATH);
 ffmpeg.setFfprobePath(FFPROBE_PATH);
 
-console.log(`✓ FFmpeg Path: ${FFMPEG_PATH}`);
-console.log(`✓ FFprobe Path: ${FFPROBE_PATH}`);
-
-// ================================
+// ════════════════════════════════════════════════════════════════
 // Middleware
-// ================================
+// ════════════════════════════════════════════════════════════════
 
 app.use(cors());
-
-// FIX #2: Increase Request Limits
 app.use(express.json({ limit: "2gb" }));
 app.use(express.urlencoded({ extended: true, limit: "2gb" }));
 app.use(express.static(path.join(__dirname, "public")));
 app.use("/output", express.static(path.join(__dirname, "output")));
+app.use((req, _res, next) => { console.log(`${req.method} ${req.originalUrl}`); next(); });
+// Auth placeholder — add bearer check here if needed
+app.use((_req, _res, next) => next());
 
-app.use((req, _res, next) => {
-  console.log(`${req.method} ${req.originalUrl}`);
-  next();
-});
-
-// ================================
-// No Token Authentication (Development/Testing)
-// ================================
-
-app.use((req, res, next) => {
-  next();
-});
-
-// ================================
+// ════════════════════════════════════════════════════════════════
 // Directories
-// ================================
+// ════════════════════════════════════════════════════════════════
 
 const UPLOADS_ROOT = path.join(__dirname, "uploads");
 const OUTPUT_ROOT  = path.join(__dirname, "output");
 const TEMP_ROOT    = path.join(__dirname, "temp");
 
-[UPLOADS_ROOT, OUTPUT_ROOT, TEMP_ROOT].forEach((dir) => {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
+[UPLOADS_ROOT, OUTPUT_ROOT, TEMP_ROOT].forEach(d => {
+  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 });
 
-// ================================
-// In-Memory Job Store
-// ================================
+// ════════════════════════════════════════════════════════════════
+// In-memory job store
+// ════════════════════════════════════════════════════════════════
 
 const jobs = {};
 
 function createJob() {
   const jobId = crypto.randomBytes(8).toString("hex");
-  jobs[jobId] = {
-    status: "queued",
-    progress: 0,
-    url: null,
-    error: null,
-    createdAt: new Date()
-  };
+  jobs[jobId] = { status: "queued", progress: 0, url: null, error: null, createdAt: new Date() };
   return jobId;
 }
+function updateJob(id, patch) { if (jobs[id]) Object.assign(jobs[id], patch); }
+function scheduleJobEviction(id) { setTimeout(() => { delete jobs[id]; }, RC.JOB_TTL_MS); }
 
-function updateJob(jobId, patch) {
-  if (jobs[jobId]) Object.assign(jobs[jobId], patch);
-}
-
-function scheduleJobEviction(jobId) {
-  setTimeout(() => { delete jobs[jobId]; }, 3 * 60 * 60 * 1000);
-}
-
-// ================================
+// ════════════════════════════════════════════════════════════════
 // Helpers
-// ================================
+// ════════════════════════════════════════════════════════════════
 
-function safeName(value, fallback) {
-  const raw = String(value || fallback || "").trim();
-  return raw.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80) || fallback;
+function safeName(v, fallback) {
+  return (String(v || fallback || "").trim().replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80)) || fallback;
 }
 
 function extFor(file, fallback) {
-  const original = file?.originalname ? path.extname(file.originalname) : "";
-  if (original) return original.toLowerCase();
-
-  const mime = (file?.mimetype || "").toLowerCase();
-  if (mime.includes("jpeg")) return ".jpg";
-  if (mime.includes("png"))  return ".png";
-  if (mime.includes("webp")) return ".webp";
-  if (mime.includes("wav"))  return ".wav";
-  if (mime.includes("mpeg")) return ".mp3";
-  if (mime.includes("mp3"))  return ".mp3";
-  if (mime.includes("mp4"))  return ".mp4";
+  const ext = file?.originalname ? path.extname(file.originalname) : "";
+  if (ext) return ext.toLowerCase();
+  const m = (file?.mimetype || "").toLowerCase();
+  if (m.includes("jpeg")) return ".jpg";
+  if (m.includes("png"))  return ".png";
+  if (m.includes("webp")) return ".webp";
+  if (m.includes("wav"))  return ".wav";
+  if (m.includes("mp3") || m.includes("mpeg")) return ".mp3";
+  if (m.includes("mp4")) return ".mp4";
   return fallback;
 }
 
 function wrapText(text, maxW = 44) {
-  if (!text || !text.trim()) return "";
-
+  if (!text?.trim()) return "";
   const words = text.trim().split(/\s+/);
   const lines = [];
   let line = "";
-
-  for (const word of words) {
-    const candidate = line ? `${line} ${word}` : word;
-    if (candidate.length <= maxW) {
-      line = candidate;
-    } else {
-      if (line) lines.push(line);
-      line = word.slice(0, maxW);
-    }
+  for (const w of words) {
+    const c = line ? `${line} ${w}` : w;
+    if (c.length <= maxW) { line = c; }
+    else { if (line) lines.push(line); line = w.slice(0, maxW); }
   }
-
   if (line) lines.push(line);
   return lines.slice(0, 3).join("\n");
 }
 
 function cleanupFiles(files = []) {
-  files.forEach((file) => {
-    try { fs.unlinkSync(file); } catch (_) {}
-  });
+  for (const f of files) { try { fs.unlinkSync(f); } catch (_) {} }
 }
 
-// ================================
-// Get Audio Duration (with fallback)
-// ================================
+// ════════════════════════════════════════════════════════════════
+// Smart FPS — fewer frames = lighter FFmpeg
+// ════════════════════════════════════════════════════════════════
+
+function getFps(panelCount) {
+  if (panelCount <= 100)  return 24;
+  if (panelCount <= 500)  return 20;
+  if (panelCount <= 1000) return 15;
+  return 12;
+}
+
+// ════════════════════════════════════════════════════════════════
+// Audio probe
+// ════════════════════════════════════════════════════════════════
 
 function getAudioDuration(audioPath) {
-  return new Promise((resolve) => {
-    if (!fs.existsSync(audioPath)) {
-      return resolve({ valid: false, reason: "Audio file does not exist" });
-    }
-
+  return new Promise(resolve => {
+    if (!fs.existsSync(audioPath)) return resolve({ valid: false, reason: "file missing" });
     ffmpeg.ffprobe(audioPath, (err, data) => {
-      if (err) {
-        return resolve({ valid: false, reason: `ffprobe error: ${err.message}` });
-      }
-
-      const audioStream = data.streams?.find(s => s.codec_type === "audio");
-      if (!audioStream) {
-        return resolve({ valid: false, reason: "No audio stream found" });
-      }
-
-      const duration = parseFloat(
-        audioStream.duration ||
-        data.format?.duration ||
-        0
-      );
-
-      if (!duration || duration <= 0) {
-        return resolve({ valid: false, reason: "Invalid audio duration" });
-      }
-
-      resolve({ valid: true, duration });
+      if (err) return resolve({ valid: false, reason: err.message });
+      const s = data.streams?.find(s => s.codec_type === "audio");
+      if (!s)  return resolve({ valid: false, reason: "no audio stream" });
+      const dur = parseFloat(s.duration || data.format?.duration || 0);
+      if (!dur || dur <= 0) return resolve({ valid: false, reason: "invalid duration" });
+      resolve({ valid: true, duration: dur });
     });
   });
 }
 
-// ================================
-// Get Image Dimensions
-// ================================
+// ════════════════════════════════════════════════════════════════
+// Image probe
+// ════════════════════════════════════════════════════════════════
 
 function getImageDimensions(imagePath) {
-  return new Promise((resolve) => {
-    if (!fs.existsSync(imagePath)) {
-      return resolve({ valid: false, reason: "Image file does not exist" });
-    }
-
+  return new Promise(resolve => {
+    if (!fs.existsSync(imagePath)) return resolve({ valid: false });
     ffmpeg.ffprobe(imagePath, (err, data) => {
-      if (err) {
-        return resolve({ valid: false, reason: `ffprobe error: ${err.message}` });
-      }
-
-      const videoStream = data.streams?.find(s => s.codec_type === "video");
-      if (!videoStream) {
-        return resolve({ valid: false, reason: "No image stream found" });
-      }
-
-      const width = videoStream.width || 0;
-      const height = videoStream.height || 0;
-
-      if (!width || !height) {
-        return resolve({ valid: false, reason: "Could not determine image dimensions" });
-      }
-
-      const aspectRatio = width / height;
-      resolve({
-        valid: true,
-        width,
-        height,
-        aspectRatio
-      });
+      if (err) return resolve({ valid: false });
+      const s = data.streams?.find(s => s.codec_type === "video");
+      if (!s || !s.width || !s.height) return resolve({ valid: false });
+      resolve({ valid: true, width: s.width, height: s.height, aspectRatio: s.width / s.height });
     });
   });
 }
 
-// ================================
-// Calculate Panel Duration (with priority order)
-// ================================
+// ════════════════════════════════════════════════════════════════
+// Panel duration calculator
+// ════════════════════════════════════════════════════════════════
 
 async function calculatePanelDuration(panel) {
-  const PADDING = 0.2;
+  const PAD = 0.2;
 
-  // Priority 1: ZIP MP3 audio (actual duration)
   if (panel.audio && panel.audio_source === "zip") {
-    const audioPath = path.join(panel.dir, panel.audio);
-    const result = await getAudioDuration(audioPath);
-    if (result.valid) {
-      const duration = result.duration + PADDING;
-      console.log(`[panel ${panel.index + 1}] ${panel.audio} → ${result.duration.toFixed(1)} sec + ${PADDING} sec padding = ${duration.toFixed(1)} sec`);
-      return duration;
-    } else {
-      throw new Error(`Panel ${panel.index + 1} audio corrupted: ${result.reason}`);
-    }
+    const r = await getAudioDuration(path.join(panel.dir, panel.audio));
+    if (r.valid) { console.log(`[panel ${panel.index + 1}] zip audio → ${r.duration.toFixed(1)}s + ${PAD}s`); return r.duration + PAD; }
+    throw new Error(`Panel ${panel.index + 1} audio corrupted: ${r.reason}`);
   }
-
-  // Priority 2: Edge TTS duration (from metadata)
   if (panel.tts_duration && panel.tts_provider === "edge") {
-    const duration = panel.tts_duration + PADDING;
-    console.log(`[panel ${panel.index + 1}] Edge TTS → ${panel.tts_duration.toFixed(1)} sec + ${PADDING} sec padding = ${duration.toFixed(1)} sec`);
-    return duration;
+    const dur = panel.tts_duration + PAD;
+    console.log(`[panel ${panel.index + 1}] Edge TTS → ${dur.toFixed(1)}s`);
+    return dur;
   }
-
-  // Priority 3: gTTS duration (from metadata)
   if (panel.tts_duration && panel.tts_provider === "gtts") {
-    const duration = panel.tts_duration + PADDING;
-    console.log(`[panel ${panel.index + 1}] gTTS → ${panel.tts_duration.toFixed(1)} sec + ${PADDING} sec padding = ${duration.toFixed(1)} sec`);
-    return duration;
+    const dur = panel.tts_duration + PAD;
+    console.log(`[panel ${panel.index + 1}] gTTS → ${dur.toFixed(1)}s`);
+    return dur;
   }
-
-  // Priority 4: Narration text fallback
   if (panel.narration) {
-    const wordCount = String(panel.narration).split(/\s+/).filter(Boolean).length;
-    const duration = Math.max(3, Math.min(12, Math.round(wordCount / 2.3) + 1));
-    console.log(`[panel ${panel.index + 1}] narration (${wordCount} words) → ${duration} sec`);
-    return duration;
+    const wc  = String(panel.narration).split(/\s+/).filter(Boolean).length;
+    const dur = Math.max(3, Math.min(12, Math.round(wc / 2.3) + 1));
+    console.log(`[panel ${panel.index + 1}] text (${wc}w) → ${dur}s`);
+    return dur;
   }
-
-  // Priority 5: Default
-  console.log(`[panel ${panel.index + 1}] no audio/narration → default 4 sec`);
   return 4;
 }
 
-// ================================
-// Validate Segment
-// ================================
+// ════════════════════════════════════════════════════════════════
+// Segment validator
+// ════════════════════════════════════════════════════════════════
 
 function validateSegment(segPath) {
-  return new Promise((resolve) => {
-    if (!fs.existsSync(segPath)) {
-      return resolve({ valid: false, reason: "File does not exist" });
-    }
-
+  return new Promise(resolve => {
+    if (!fs.existsSync(segPath)) return resolve({ valid: false, reason: "missing" });
     ffmpeg.ffprobe(segPath, (err, data) => {
-      if (err) {
-        return resolve({ valid: false, reason: `ffprobe error: ${err.message}` });
-      }
-
-      const hasVideo = data.streams?.some(s => s.codec_type === "video");
-      const hasAudio = data.streams?.some(s => s.codec_type === "audio");
-
-      if (!hasVideo) {
-        return resolve({ valid: false, reason: "No video stream found" });
-      }
-
-      if (!hasAudio) {
-        return resolve({ valid: false, reason: "No audio stream found" });
-      }
-
-      resolve({ valid: true, data });
+      if (err) return resolve({ valid: false, reason: err.message });
+      const hasV = data.streams?.some(s => s.codec_type === "video");
+      const hasA = data.streams?.some(s => s.codec_type === "audio");
+      if (!hasV) return resolve({ valid: false, reason: "no video stream" });
+      if (!hasA) return resolve({ valid: false, reason: "no audio stream" });
+      resolve({ valid: true });
     });
   });
 }
 
-// ================================
-// Multer - FIX #1: Use diskStorage instead of memoryStorage
-// ================================
+// ════════════════════════════════════════════════════════════════
+// Ken-Burns / motion filter builder
+// ════════════════════════════════════════════════════════════════
+//
+// FIT MODE     — full image visible, black letterbox, no zoompan
+// CINEMATIC    — 2% zoom + gentle pan; internal fps = RC.ZOOMPAN_FPS
+//
+// All zoompan uses RC.ZOOM_AMOUNT (1.02) and tiny pixel offsets to avoid
+// aggressive crop while still providing subtle motion.
+// ════════════════════════════════════════════════════════════════
 
-// FIX #1: Panel upload now uses diskStorage for better memory handling
-const panelDiskStorage = multer.diskStorage({
-  destination: UPLOADS_ROOT,
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase() || ".jpg";
-    cb(null, `panel_${Date.now()}_${crypto.randomBytes(4).toString("hex")}${ext}`);
-  }
-});
-
-const panelUpload = multer({
-  storage: panelDiskStorage,
-  limits: { fileSize: 500 * 1024 * 1024, files: 4 }
-});
-
-const diskStorage = multer.diskStorage({
-  destination: UPLOADS_ROOT,
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase() || ".jpg";
-    cb(null, `${Date.now()}_${crypto.randomBytes(4).toString("hex")}${ext}`);
-  }
-});
-
-// FIX: Increased fileSize limit from 2MB to 300MB to support larger uploads
-const diskUpload = multer({
-  storage: diskStorage,
-  limits: {
-    fileSize: 300 * 1024 * 1024,  // 300MB per file (was 2MB)
-    files: 3000                    // up to 3000 files
-  }
-});
-
-// FIX #1: Audio ZIP upload now uses diskStorage instead of memoryStorage
-const zipDiskStorage = multer.diskStorage({
-  destination: TEMP_ROOT,
-  filename: (_req, file, cb) => {
-    cb(null, `audio_zip_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.zip`);
-  }
-});
-
-const zipUpload = multer({
-  storage: zipDiskStorage,
-  limits: { fileSize: 500 * 1024 * 1024, files: 1 }
-});
-
-// ================================
-// OPTIMIZED: Smart FPS based on panel count
-// ================================
-
-function getFps(panelCount) {
-  if (panelCount <= 100)  return 24;   // ← High quality: up to 100 panels
-  if (panelCount <= 300)  return 20;   // ← Good quality: 100-300 panels
-  if (panelCount <= 500)  return 18;   // ← Stable: 300-500 panels
-  if (panelCount <= 1000) return 15;   // ← Smooth: 500-1000 panels
-  if (panelCount <= 2000) return 12;   // ← Balanced: 1000-2000 panels
-  return 10;                             // ← Conservative: 2000+ panels
+function buildScaleFilter() {
+  // High-quality Lanczos scaling into a black-padded 1280×720 frame
+  return `scale=${RC.W}:${RC.H}:force_original_aspect_ratio=decrease:flags=lanczos,` +
+         `pad=${RC.W}:${RC.H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
 }
 
-// ================================
-// ENHANCEMENT: Aspect Ratio Helper
-// ================================
+function getKenBurnsFilter(idx, duration, panelCount, aspectMode) {
+  const fps    = RC.ZOOMPAN_FPS;
+  const frames = Math.max(1, Math.ceil(duration * fps));
+  const z      = RC.ZOOM_AMOUNT;
+  const px     = RC.PAN_PIXELS;
+  const py     = RC.PAN_PIXELS_Y;
+  const WH     = `${RC.W}x${RC.H}`;
+  const scale  = buildScaleFilter();
 
-function calculateFitInFrame(imageAspectRatio, frameWidth = 1280, frameHeight = 720) {
-  const frameAspect = frameWidth / frameHeight;
-  
-  let scaledWidth, scaledHeight;
-  
-  if (imageAspectRatio > frameAspect) {
-    // Image is wider than frame
-    scaledWidth = frameWidth;
-    scaledHeight = Math.round(frameWidth / imageAspectRatio);
-  } else {
-    // Image is taller than frame
-    scaledHeight = frameHeight;
-    scaledWidth = Math.round(frameHeight * imageAspectRatio);
+  const mode = String(aspectMode || "fit").toLowerCase().trim();
+
+  if (mode !== "cinematic") {
+    // FIT: no zoompan at all — just scale+pad+setsar, no motion
+    return scale;
   }
-  
-  const offsetX = Math.round((frameWidth - scaledWidth) / 2);
-  const offsetY = Math.round((frameHeight - scaledHeight) / 2);
-  
-  return { scaledWidth, scaledHeight, offsetX, offsetY };
+
+  // CINEMATIC: subtle motion — pick one of 5 patterns round-robin
+  // We scale first (lightweight), then apply zoompan on the already-scaled stream.
+  // zoompan operates on the padded 1280×720 frame so it never crops outside the image.
+  const cx = `iw/2-(iw/zoom/2)`;
+  const cy = `ih/2-(ih/zoom/2)`;
+
+  const patterns = [
+    // 0: gentle zoom-in from centre
+    `zoompan=z='min(zoom+0.0004,${z})':x='${cx}':y='${cy}':d=${frames}:s=${WH}:fps=${fps}`,
+    // 1: gentle zoom-out from centre
+    `zoompan=z='if(lte(on,1),${z},max(zoom-0.0004,1.0))':x='${cx}':y='${cy}':d=${frames}:s=${WH}:fps=${fps}`,
+    // 2: subtle left-to-right pan
+    `zoompan=z='${z}':x='min(${cx}+(on*${px}/${frames}),iw-iw/zoom)':y='${cy}':d=${frames}:s=${WH}:fps=${fps}`,
+    // 3: subtle right-to-left pan
+    `zoompan=z='${z}':x='max(${cx}-(on*${px}/${frames}),0)':y='${cy}':d=${frames}:s=${WH}:fps=${fps}`,
+    // 4: subtle up pan
+    `zoompan=z='${z}':x='${cx}':y='max(${cy}-(on*${py}/${frames}),0)':d=${frames}:s=${WH}:fps=${fps}`,
+  ];
+
+  const chosenPan = patterns[idx % patterns.length];
+  return `${scale},${chosenPan}`;
 }
 
-// ================================
-// FIXED: Ken Burns Animation (Gentle & Aspect-Aware)
-// ================================
-
-function getKenBurnsFilter(idx, duration, panelCount = 1, aspectMode = "fit") {
-  const fps = getFps(panelCount);
-  const totalFrames = Math.ceil(duration * fps);
-
-  // Mode selection
-  const normalised = String(aspectMode || "fit").toLowerCase().trim();
-  
-  if (normalised === "fit") {
-    // MODE 1: FIT MODE - Show full image, no cropping
-    // Use padding with black background (cinematic look)
-    return `scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`;
-  } else if (normalised === "cinematic") {
-    // MODE 2: SMART CINEMATIC MODE - Subtle zoom (max 5% to 8%)
-    // Gentle Ken Burns effect without aggressive cropping
-    const subtleZoom = "1.05";  // ← Reduced to 5% zoom (was 30%)
-    
-    const animations = [
-      // Gentle center zoom
-      `scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,zoompan=z='1.0':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=${fps}`,
-      // Subtle left pan
-      `scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,zoompan=z='${subtleZoom}':x='if(lte(on,1),iw/2-(iw/zoom/2),min(iw/2-(iw/zoom/2)+10,iw-iw/zoom))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=${fps}`,
-      // Subtle right pan
-      `scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,zoompan=z='${subtleZoom}':x='if(lte(on,1),iw/2-(iw/zoom/2),max(iw/2-(iw/zoom/2)-10,0))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=${fps}`,
-      // Subtle up pan
-      `scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,zoompan=z='${subtleZoom}':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih/2-(ih/zoom/2),max(ih/2-(ih/zoom/2)-5,0))':d=${totalFrames}:s=1280x720:fps=${fps}`,
-      // Subtle down pan
-      `scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,zoompan=z='${subtleZoom}':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih/2-(ih/zoom/2),min(ih/2-(ih/zoom/2)+5,ih-ih/zoom))':d=${totalFrames}:s=1280x720:fps=${fps}`,
-    ];
-    
-    return animations[idx % animations.length];
-  }
-  
-  // Default: FIT MODE
-  return `scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`;
-}
-
-// ================================
-// ENHANCEMENT 1: Build FFmpeg audio filter chain with smooth normalization
-// ================================
+// ════════════════════════════════════════════════════════════════
+// Audio filter chain
+// ════════════════════════════════════════════════════════════════
 
 function buildAudioFilterChain(options = {}) {
   const filters = [];
-  
-  // Audio normalization for consistent loudness
   if (options.audioNormalize || options.loudnorm) {
+    // EBU R128 loudness normalisation — consistent voice level, no clipping
     filters.push("loudnorm=I=-16:TP=-1.5:LRA=11");
   }
-  
-  // Optional: Add gentle compression for smooth transitions
   if (options.smoothAudio) {
+    // Light dynamic compression — prevents sudden jumps
     filters.push("acompressor=threshold=0.05:ratio=4:attack=5:release=50");
   }
-  
-  return filters.length ? filters.join(",") : "";
-}
-
-// ================================
-// ENHANCEMENT 2: Build FFmpeg video filter chain with quality optimization
-// ================================
-
-function buildVideoFilterChain(options = {}, baseFilter = "") {
-  const filters = [baseFilter];
-  
-  // Optional zoom/crop adjustments (subtle, not aggressive)
-  if (options.zoom || options.zoomFactor || options.cropX || options.cropY) {
-    const zoomFactor = parseFloat(options.zoomFactor || options.zoom || 1.0);
-    if (zoomFactor > 1.0 && zoomFactor <= 1.15) {  // ← Limited to max 15% zoom
-      const centerX = Math.max(0, parseFloat(options.focusX || 0.5) * 1280);
-      const centerY = Math.max(0, parseFloat(options.focusY || 0.5) * 720);
-      filters.push(`zoom=z=${zoomFactor}:x='${centerX}':y='${centerY}'`);
-    }
-  }
-  
   return filters.join(",");
 }
 
-// ================================
-// Create Segment (MP4) - OPTIMIZED for quality & speed
-// ================================
+// ════════════════════════════════════════════════════════════════
+// Watermark overlay filter
+// ════════════════════════════════════════════════════════════════
 
-function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount, aspectMode, renderOptions = {} }) {
+function buildWatermarkFilter(opts = {}) {
+  const margin  = parseInt(opts.wmMargin  ?? RC.WM_MARGIN);
+  const opacity = parseFloat(opts.wmOpacity ?? RC.WM_OPACITY);
+  const scale   = parseFloat(opts.wmScale  ?? RC.WM_SCALE);
+  const pos     = String(opts.wmPosition || RC.WM_POSITION).toLowerCase();
+
+  const scaledW = Math.round(RC.W * scale);
+
+  const positions = {
+    "bottom-right": `x=main_w-overlay_w-${margin}:y=main_h-overlay_h-${margin}`,
+    "bottom-left":  `x=${margin}:y=main_h-overlay_h-${margin}`,
+    "top-right":    `x=main_w-overlay_w-${margin}:y=${margin}`,
+    "top-left":     `x=${margin}:y=${margin}`,
+    "center":       `x=(main_w-overlay_w)/2:y=(main_h-overlay_h)/2`,
+  };
+  const posStr = positions[pos] || positions["bottom-right"];
+
+  // Scale watermark, set alpha, then overlay
+  return {
+    wmScale: `scale=${scaledW}:-1`,
+    overlay: `format=rgba,colorchannelmixer=aa=${opacity.toFixed(2)}`,
+    position: posStr,
+  };
+}
+
+// ════════════════════════════════════════════════════════════════
+// Extract render options from request body
+// ════════════════════════════════════════════════════════════════
+
+function extractRenderOptions(body) {
+  return {
+    // Encoding
+    crf:           Math.max(18, Math.min(32, parseInt(body.crf)  || RC.CRF)),
+    preset:        body.preset        || RC.PRESET,
+    audioBitrate:  body.audioBitrate  || RC.AUDIO_BITRATE,
+    pixFmt:        body.pixFmt        || RC.PIX_FMT,
+    videoCodec:    body.videoCodec    || "libx264",
+    movflags:      body.movflags      || RC.MOVFLAGS,
+    maxrate:       body.maxrate       || "",
+    bufsize:       body.bufsize       || "",
+    // Aspect
+    aspectMode:    body.aspectMode || body.aspect_mode || "fit",
+    // Audio processing
+    audioNormalize: body.audioNormalize === true || body.audioNormalize === "true",
+    loudnorm:       body.loudnorm       === true || body.loudnorm       === "true",
+    smoothAudio:    body.smoothAudio    === true || body.smoothAudio    === "true",
+    // Watermark
+    watermarkFile: null,  // filled by route handlers when a file is uploaded
+    wmPosition:    body.wmPosition || body.watermark_position || RC.WM_POSITION,
+    wmOpacity:     parseFloat(body.wmOpacity  || body.watermark_opacity || RC.WM_OPACITY),
+    wmScale:       parseFloat(body.wmScale    || body.watermark_scale   || RC.WM_SCALE),
+    wmMargin:      parseInt  (body.wmMargin   || body.watermark_margin  || RC.WM_MARGIN),
+  };
+}
+
+// ════════════════════════════════════════════════════════════════
+// Create single segment MP4
+// ════════════════════════════════════════════════════════════════
+
+function createSegment({ imagePath, audioPath, text, duration, outPath,
+                         jobId, idx, panelCount, aspectMode, renderOptions = {} }) {
   return new Promise((resolve, reject) => {
-    const FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
-    const wrapped = wrapText(text);
-    const kenBurns = getKenBurnsFilter(idx, duration, panelCount, aspectMode);
-    
-    const vfParts = [
-      buildVideoFilterChain(renderOptions, kenBurns),
-      "setsar=1"
-    ];
+    const FONT   = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
+    const fps    = getFps(panelCount);
+    const kenVf  = getKenBurnsFilter(idx, duration, panelCount, aspectMode);
+
+    const vfParts = [kenVf];
+    // Subtitle overlay (optional text)
+    if (text && text.trim() && fs.existsSync(FONT)) {
+      const safe = wrapText(text);
+      if (safe) {
+        vfParts.push(
+          `drawtext=fontfile='${FONT}':text='${safe.replace(/'/g, "\\'")}':` +
+          `fontsize=22:fontcolor=white:borderw=2:bordercolor=black:` +
+          `x=(w-text_w)/2:y=h-th-30`
+        );
+      }
+    }
 
     const hasAudio = audioPath && fs.existsSync(audioPath);
-
-    const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-    console.log(`[${RENDERER_NAME}][seg${idx}] START — jobId=${jobId} mode=${aspectMode} dur=${duration}s panelCount=${panelCount} mem=${memMB}MB`);
+    const memMB   = Math.round(process.memoryUsage().rss / 1024 / 1024);
+    console.log(`[seg${idx}] START mode=${aspectMode} dur=${duration}s fps=${fps} mem=${memMB}MB`);
 
     const cmd = ffmpeg()
       .setFfmpegPath(FFMPEG_PATH)
       .input(imagePath)
-      .inputOptions(["-loop 1", "-framerate 30"]);  // ← Higher input framerate for smoother scaling
+      // Use RC.ZOOMPAN_FPS as input framerate only in cinematic mode (avoids unnecessary frames in fit mode)
+      .inputOptions(["-loop 1", `-framerate ${String(aspectMode).toLowerCase() === "cinematic" ? RC.ZOOMPAN_FPS : fps}`]);
 
     if (hasAudio) {
       cmd.input(audioPath);
@@ -521,1003 +423,733 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
         .inputOptions(["-f lavfi"]);
     }
 
-    const fps = getFps(panelCount);
-
-    // Extract encoding options from payload (with safe defaults optimized for quality)
-    const videoCodec = renderOptions.videoCodec || "libx264";
-    const pixFmt = renderOptions.pixFmt || "yuv420p";
-    const crf = Math.max(18, Math.min(28, parseInt(renderOptions.crf) || 23));  // ← Better quality default (23 instead of 26)
-    const preset = renderOptions.preset || "fast";  // ← Faster than ultrafast but better quality
-    const maxrate = renderOptions.maxrate || "";
-    const bufsize = renderOptions.bufsize || "";
-    const audioBitrate = renderOptions.audioBitrate || "192k";  // ← Higher audio bitrate (was 128k)
-    const movflags = renderOptions.movflags ? String(renderOptions.movflags) : "+faststart";
+    const audioFilter = buildAudioFilterChain(renderOptions);
 
     const outputOpts = [
       `-vf ${vfParts.join(",")}`,
-      `-c:v ${videoCodec}`,
-      `-pix_fmt ${pixFmt}`,
+      `-c:v ${renderOptions.videoCodec || "libx264"}`,
+      `-pix_fmt ${renderOptions.pixFmt || RC.PIX_FMT}`,
       `-r ${fps}`,
-      `-crf ${crf}`,
-      `-preset ${preset}`,
-      `-threads 4`,  // ← Increased from 2 to 4 for faster encoding
-      `-movflags ${movflags}`,
+      `-crf ${renderOptions.crf || RC.CRF}`,
+      `-preset ${renderOptions.preset || RC.PRESET}`,
+      `-threads ${RC.THREADS}`,
+      `-movflags ${renderOptions.movflags || RC.MOVFLAGS}`,
       `-c:a aac`,
-      `-b:a ${audioBitrate}`,
+      `-b:a ${renderOptions.audioBitrate || RC.AUDIO_BITRATE}`,
       "-shortest",
-      `-t ${duration}`
+      `-t ${duration}`,
     ];
 
-    // Add bitrate control if specified
-    if (maxrate) outputOpts.splice(-3, 0, `-maxrate ${maxrate}`);
-    if (bufsize) outputOpts.splice(-3, 0, `-bufsize ${bufsize}`);
-
-    // Add audio normalization filter for smooth transitions
-    const audioFilter = buildAudioFilterChain(renderOptions);
-    if (audioFilter) {
-      outputOpts.splice(0, 0, `-af ${audioFilter}`);
-    }
+    if (renderOptions.maxrate) outputOpts.splice(-3, 0, `-maxrate ${renderOptions.maxrate}`);
+    if (renderOptions.bufsize) outputOpts.splice(-3, 0, `-bufsize ${renderOptions.bufsize}`);
+    if (audioFilter) outputOpts.splice(0, 0, `-af ${audioFilter}`);
 
     cmd
       .outputOptions(outputOpts)
       .output(outPath)
-      .on("start", (cmd) => {
-        console.log(`[seg${idx}] FFmpeg encoding started`);
-      })
-      .on("progress", (progress) => {
-        // suppress per-frame logs
-      })
+      .on("start", () => console.log(`[seg${idx}] encoding…`))
+      .on("progress", () => {})
       .on("end", () => {
-        const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-        console.log(`[seg${idx}] END — mem=${memMB}MB`);
+        const m = Math.round(process.memoryUsage().rss / 1024 / 1024);
+        console.log(`[seg${idx}] ✓ done mem=${m}MB`);
         resolve();
       })
       .on("error", (err) => {
-        const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-        const isOOM = err.message.includes("Cannot allocate memory") ||
-                      err.message.includes("Out of memory") ||
-                      err.message.includes("ENOMEM") ||
-                      err.message.includes("killed");
-        if (isOOM) {
-          console.error(`[seg${idx}] ❌ OOM CRASH — mem=${memMB}MB — ${err.message}`);
-        } else {
-          console.error(`[seg${idx}] ❌ ERROR — mem=${memMB}MB — ${err.message}`);
-        }
+        const m   = Math.round(process.memoryUsage().rss / 1024 / 1024);
+        const oom = err.message.includes("Cannot allocate memory") ||
+                    err.message.includes("Out of memory") ||
+                    err.message.includes("ENOMEM") ||
+                    err.message.includes("killed");
+        console.error(`[seg${idx}] ❌ ${oom ? "OOM" : "ERROR"} mem=${m}MB — ${err.message.split("\n")[0]}`);
         reject(err);
       })
       .run();
   });
 }
 
-// ================================
-// createSegment with retry + skip on failure
-// ================================
+// ════════════════════════════════════════════════════════════════
+// createSegment with retry + graceful skip
+// ════════════════════════════════════════════════════════════════
 
-async function createSegmentSafe({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount, aspectMode, renderOptions = {} }) {
-  const MAX_RETRIES = 2;
+async function createSegmentSafe(params) {
   let lastErr;
-
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+  for (let attempt = 1; attempt <= RC.MAX_RETRIES; attempt++) {
     try {
-      await createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount, aspectMode, renderOptions });
+      await createSegment(params);
+      // quick sanity-check
+      const v = await validateSegment(params.outPath);
+      if (!v.valid) throw new Error(`Segment invalid after encode: ${v.reason}`);
       return { success: true };
     } catch (err) {
       lastErr = err;
-      const isOOM = err.message.includes("Cannot allocate memory") ||
-                    err.message.includes("Out of memory") ||
-                    err.message.includes("ENOMEM") ||
-                    err.message.includes("killed");
-      console.warn(`[seg${idx}] attempt ${attempt}/${MAX_RETRIES} failed${isOOM ? " (OOM)" : ""}: ${err.message.split("\n")[0]}`);
-      if (isOOM) {
-        await new Promise(r => setTimeout(r, 3000 * attempt));
-      }
+      const oom = err.message.includes("Cannot allocate memory") ||
+                  err.message.includes("Out of memory") ||
+                  err.message.includes("ENOMEM") ||
+                  err.message.includes("killed");
+      console.warn(`[seg${params.idx}] attempt ${attempt}/${RC.MAX_RETRIES} failed${oom ? " (OOM)" : ""}: ${err.message.split("\n")[0]}`);
+      // Clean broken output before retry
+      try { fs.unlinkSync(params.outPath); } catch (_) {}
+      if (oom) await new Promise(r => setTimeout(r, 3000 * attempt));
     }
   }
-
-  console.error(`[seg${idx}] ❌ ALL RETRIES FAILED — skipping panel. Last error: ${lastErr.message.split("\n")[0]}`);
+  console.error(`[seg${params.idx}] ❌ ALL RETRIES FAILED — skipping. Last: ${lastErr.message.split("\n")[0]}`);
   return { success: false, error: lastErr.message };
 }
 
-// ================================
-// SPAWN FFmpeg Helper
-// ================================
+// ════════════════════════════════════════════════════════════════
+// Spawn FFmpeg directly (for complex filter_complex operations)
+// ════════════════════════════════════════════════════════════════
 
-function spawnFfmpeg(args, description = "") {
+function spawnFfmpeg(args, desc = "") {
   return new Promise((resolve, reject) => {
-    console.log(`[ffmpeg] Running: ffmpeg ${args.join(" ")}`);
-    const proc = spawn(FFMPEG_PATH, args, {
-      stdio: ["pipe", "pipe", "pipe"]
-    });
-
-    let stdout = "";
+    console.log(`[ffmpeg] ${desc || "run"}: ffmpeg ${args.slice(0, 6).join(" ")} …`);
+    const proc = spawn(FFMPEG_PATH, args, { stdio: ["pipe", "pipe", "pipe"] });
     let stderr = "";
-
-    proc.stdout?.on("data", (data) => {
-      stdout += data.toString();
+    proc.stderr?.on("data", d => { stderr += d; });
+    proc.on("close", code => {
+      if (code === 0) return resolve({ success: true, stderr });
+      const oom = stderr.includes("Cannot allocate memory") || stderr.includes("ENOMEM") || code === 137;
+      const m   = Math.round(process.memoryUsage().rss / 1024 / 1024);
+      reject(new Error(`FFmpeg ${oom ? "OOM" : `failed (${code})`}: ${desc} mem=${m}MB\n${stderr.slice(-800)}`));
     });
-
-    proc.stderr?.on("data", (data) => {
-      stderr += data.toString();
-      console.log(`[ffmpeg] stderr: ${data}`);
-    });
-
-    proc.on("close", (code) => {
-      if (code === 0) {
-        console.log(`[ffmpeg] ✓ ${description || "Command"} succeeded`);
-        resolve({ success: true, stdout, stderr });
-      } else {
-        const isOOM = stderr.includes("Cannot allocate memory") ||
-                      stderr.includes("Out of memory") ||
-                      stderr.includes("ENOMEM") ||
-                      code === 137;
-        const label = isOOM ? "❌ OOM KILL" : "✗";
-        const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-        const err = new Error(`FFmpeg ${isOOM ? "OOM" : `failed (code ${code})`}: ${description} — mem=${memMB}MB\n${stderr.slice(-800)}`);
-        console.error(`[ffmpeg] ${label} ${description} code=${code} mem=${memMB}MB`);
-        reject(err);
-      }
-    });
-
-    proc.on("error", (err) => {
-      console.error(`[ffmpeg] spawn error:`, err.message);
-      reject(err);
-    });
+    proc.on("error", reject);
   });
 }
 
-// ================================
-// CONCAT WITH SMOOTH TRANSITIONS — batch + recursive merge
-// ================================
+// ════════════════════════════════════════════════════════════════
+// Apply watermark to finished video
+// ════════════════════════════════════════════════════════════════
 
-const BATCH_SIZE = 50;
-
-async function concatWithTransitions(segPaths, durations, outPath, renderOptions = {}) {
-  const n = segPaths.length;
-  const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-  console.log(`\n[concat] START — ${n} segments — mem=${memMB}MB`);
-
-  if (!n) throw new Error("No segments to concat");
-
-  if (n === 1) {
-    console.log("[concat] Single segment — copying directly");
-    fs.copyFileSync(segPaths[0], outPath);
+async function applyWatermark(inputPath, watermarkPath, outputPath, renderOptions = {}) {
+  if (!watermarkPath || !fs.existsSync(watermarkPath)) {
+    console.log("[watermark] no watermark file — skipping");
+    fs.copyFileSync(inputPath, outputPath);
     return;
   }
 
-  for (let i = 0; i < n; i++) {
-    if (!fs.existsSync(segPaths[i])) {
-      throw new Error(`Segment ${i} missing: ${segPaths[i]}`);
-    }
-  }
+  console.log(`[watermark] applying ${path.basename(watermarkPath)} → ${path.basename(outputPath)}`);
+  const wm  = buildWatermarkFilter(renderOptions);
+  const crf = renderOptions.crf || RC.CRF;
 
-  if (n <= BATCH_SIZE) {
-    const USE_XFADE = n <= 12;  // ← Optimized for smooth audio transitions
-    console.log(`[concat] strategy=${USE_XFADE ? "xfade-with-smooth-audio" : "simple-concat"} (${n} clips)`);
-    if (USE_XFADE) {
-      await concatWithXfade(segPaths, durations, outPath, renderOptions);
-    } else {
-      await concatSimple(segPaths, outPath, renderOptions);
-    }
-  } else {
-    await batchMerge(segPaths, durations, outPath, renderOptions);
-  }
-
-  const memAfterMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-  console.log(`[concat] END — mem=${memAfterMB}MB → ${outPath}`);
+  await spawnFfmpeg([
+    "-i", inputPath,
+    "-i", watermarkPath,
+    "-filter_complex",
+    `[1:v]${wm.wmScale},${wm.overlay}[wm];[0:v][wm]overlay=${wm.position}[vout]`,
+    "-map", "[vout]",
+    "-map", "0:a",
+    "-c:v", "libx264",
+    "-pix_fmt", RC.PIX_FMT,
+    "-crf",  String(crf),
+    "-preset", RC.PRESET,
+    "-threads", String(RC.THREADS),
+    "-c:a", "copy",
+    "-movflags", RC.MOVFLAGS,
+    "-y",
+    outputPath,
+  ], "watermark overlay");
 }
 
-// ================================
-// Batch merge — split into BATCH_SIZE chunks, merge each, then recurse
-// ================================
+// ════════════════════════════════════════════════════════════════
+// Concat — xfade (≤12 clips), simple concat (>12), batch+recurse (>BATCH_SIZE)
+// ════════════════════════════════════════════════════════════════
 
-async function batchMerge(segPaths, durations, outPath, renderOptions = {}) {
+async function concatWithTransitions(segPaths, durations, outPath, renderOptions = {}) {
   const n = segPaths.length;
-  const batchCount = Math.ceil(n / BATCH_SIZE);
-  console.log(`[batchMerge] ${n} clips → ${batchCount} batches of ≤${BATCH_SIZE}`);
+  const m = Math.round(process.memoryUsage().rss / 1024 / 1024);
+  console.log(`\n[concat] ${n} segments mem=${m}MB`);
+  if (!n) throw new Error("No segments to concat");
+  if (n === 1) { fs.copyFileSync(segPaths[0], outPath); return; }
 
-  const batchOutputs = [];
-  const batchDurations = [];
-  const tempFiles = [];
-
-  for (let b = 0; b < batchCount; b++) {
-    const start = b * BATCH_SIZE;
-    const end   = Math.min(start + BATCH_SIZE, n);
-    const batchSegs = segPaths.slice(start, end);
-    const batchDurs = durations.slice(start, end);
-    const batchOut  = path.join(TEMP_ROOT, `batch_${Date.now()}_${b}.mp4`);
-
-    console.log(`[batchMerge] batch ${b + 1}/${batchCount}: clips ${start + 1}–${end}`);
-
-    const USE_XFADE = batchSegs.length <= 12;
-    if (USE_XFADE) {
-      await concatWithXfade(batchSegs, batchDurs, batchOut, renderOptions);
-    } else {
-      await concatSimple(batchSegs, batchOut, renderOptions);
-    }
-
-    batchOutputs.push(batchOut);
-    tempFiles.push(batchOut);
-
-    const totalDur = batchDurs.reduce((a, v) => a + v, 0);
-    batchDurations.push(totalDur);
-
-    const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-    console.log(`[batchMerge] batch ${b + 1} done — mem=${memMB}MB`);
+  for (let i = 0; i < n; i++) {
+    if (!fs.existsSync(segPaths[i])) throw new Error(`Segment ${i} missing: ${segPaths[i]}`);
   }
 
-  console.log(`[batchMerge] Merging ${batchOutputs.length} batch files → final`);
+  if (n > RC.BATCH_SIZE) {
+    await batchMerge(segPaths, durations, outPath, renderOptions);
+  } else if (n <= RC.XFADE_MAX) {
+    await concatWithXfade(segPaths, durations, outPath, renderOptions);
+  } else {
+    await concatSimple(segPaths, outPath, renderOptions);
+  }
+
+  console.log(`[concat] ✓ done → ${path.basename(outPath)}`);
+}
+
+// ─── Batch merge: split → merge each → recurse ───────────────────────────────
+
+async function batchMerge(segPaths, durations, outPath, renderOptions = {}) {
+  const n      = segPaths.length;
+  const bCount = Math.ceil(n / RC.BATCH_SIZE);
+  console.log(`[batchMerge] ${n} clips → ${bCount} batches`);
+
+  const batchOuts = [];
+  const batchDurs = [];
+  const tempFiles = [];
+
+  for (let b = 0; b < bCount; b++) {
+    const sl  = b * RC.BATCH_SIZE;
+    const el  = Math.min(sl + RC.BATCH_SIZE, n);
+    const bS  = segPaths.slice(sl, el);
+    const bD  = durations.slice(sl, el);
+    const bO  = path.join(TEMP_ROOT, `batch_${Date.now()}_${b}.mp4`);
+
+    console.log(`[batchMerge] batch ${b + 1}/${bCount}: clips ${sl + 1}–${el}`);
+    if (bS.length <= RC.XFADE_MAX) {
+      await concatWithXfade(bS, bD, bO, renderOptions);
+    } else {
+      await concatSimple(bS, bO, renderOptions);
+    }
+
+    batchOuts.push(bO);
+    tempFiles.push(bO);
+    batchDurs.push(bD.reduce((a, v) => a + v, 0));
+    console.log(`[batchMerge] batch ${b + 1} done mem=${Math.round(process.memoryUsage().rss / 1024 / 1024)}MB`);
+  }
+
   try {
-    await concatWithTransitions(batchOutputs, batchDurations, outPath, renderOptions);
+    await concatWithTransitions(batchOuts, batchDurs, outPath, renderOptions);
   } finally {
     cleanupFiles(tempFiles);
   }
 }
 
-// ================================
-// xfade concat with SMOOTH AUDIO transitions
-// ================================
+// ─── xfade concat (smooth crossfade, ≤ XFADE_MAX clips) ─────────────────────
 
 async function concatWithXfade(segPaths, durations, outPath, renderOptions = {}) {
-  const TRANSITION_DURATION = 0.6;  // ← Smooth fade duration
-  const TRANSITION_TYPE     = "slideright";
+  const T    = RC.XFADE_DUR;
+  const crf  = renderOptions.crf || RC.CRF;
 
-  let filterComplex = "";
-  let currentVideoLabel = "0:v";
-  let currentAudioLabel = "0:a";
+  let fc     = "";
+  let vLabel = "0:v";
+  let aLabel = "0:a";
   let offset = durations[0];
 
   for (let i = 1; i < segPaths.length; i++) {
-    const vLabel = `v${i}`;
-    const aLabel = `a${i}`;
-    filterComplex +=
-      (filterComplex ? ";" : "") +
-      `[${currentVideoLabel}][${i}:v]xfade=transition=${TRANSITION_TYPE}:duration=${TRANSITION_DURATION}:offset=${(offset - TRANSITION_DURATION).toFixed(4)}[${vLabel}]` +
-      `;[${currentAudioLabel}][${i}:a]acrossfade=d=${TRANSITION_DURATION}:c1=tri:c2=tri[${aLabel}]`;  // ← Smooth audio crossfade
-    currentVideoLabel = vLabel;
-    currentAudioLabel = aLabel;
-    offset += durations[i];
+    const vl = `v${i}`;
+    const al = `a${i}`;
+    fc +=
+      (fc ? ";" : "") +
+      `[${vLabel}][${i}:v]xfade=transition=fade:duration=${T}:offset=${(offset - T).toFixed(4)}[${vl}]` +
+      `;[${aLabel}][${i}:a]acrossfade=d=${T}:c1=tri:c2=tri[${al}]`;
+    vLabel = vl;
+    aLabel = al;
+    offset += durations[i] - T;
   }
+  fc += `;[${vLabel}]format=yuv420p[vout];[${aLabel}]aformat=sample_rates=44100:channel_layouts=stereo[aout]`;
 
-  filterComplex += `\n[${currentVideoLabel}]format=yuv420p[vout];\n[${currentAudioLabel}]aformat=sample_rates=44100:channel_layouts=stereo[aout]`;
-
-  const inputArgs = [];
-  for (const seg of segPaths) inputArgs.push("-i", seg);
-
-  const crf = Math.max(18, Math.min(28, parseInt(renderOptions.crf) || 23));
-  const preset = renderOptions.preset || "fast";
-  const pixFmt = renderOptions.pixFmt || "yuv420p";
-  const audioBitrate = renderOptions.audioBitrate || "192k";
-
+  const inputArgs = segPaths.flatMap(s => ["-i", s]);
   const outputArgs = [
-    "-filter_complex", filterComplex,
-    "-map", "[vout]",
-    "-map", "[aout]",
-    "-c:v", "libx264",
-    "-pix_fmt", pixFmt,
-    "-crf", String(crf),
-    "-preset", preset,
-    "-threads", "4",  // ← Multi-threading for faster encoding
-    "-movflags", "+faststart",
-    "-c:a", "aac",
-    "-b:a", audioBitrate,
-    "-y",
-    outPath
+    "-filter_complex", fc,
+    "-map", "[vout]", "-map", "[aout]",
+    "-c:v", "libx264", "-pix_fmt", RC.PIX_FMT,
+    "-crf", String(crf), "-preset", RC.PRESET,
+    "-threads", String(RC.THREADS),
+    "-movflags", RC.MOVFLAGS,
+    "-c:a", "aac", "-b:a", renderOptions.audioBitrate || RC.AUDIO_BITRATE,
+    "-y", outPath,
   ];
 
-  console.log("[concat] Attempting xfade concat with smooth audio...");
   try {
-    await spawnFfmpeg([...inputArgs, ...outputArgs], "xfade concat with smooth audio");
-    console.log(`[concat] ✓ xfade succeeded`);
-  } catch (xfadeErr) {
-    console.warn(`[concat] xfade failed (${xfadeErr.message.split("\n")[0]}) — falling back to simple concat`);
+    await spawnFfmpeg([...inputArgs, ...outputArgs], "xfade concat");
+  } catch (err) {
+    console.warn(`[concat] xfade failed (${err.message.split("\n")[0]}) — fallback to simple`);
     await concatSimple(segPaths, outPath, renderOptions);
   }
 }
 
-// ================================
-// simple concat (>12 clips or fallback) with optimized settings
-// ================================
+// ─── Simple concat demuxer (>XFADE_MAX clips or fallback) ────────────────────
 
 async function concatSimple(segPaths, outPath, renderOptions = {}) {
-  console.log(`[concat] Running simple concat (${segPaths.length} clips)...`);
+  console.log(`[concat] simple concat ${segPaths.length} clips`);
   const concatFile = path.join(TEMP_ROOT, `concat_${Date.now()}.txt`);
   fs.writeFileSync(concatFile, segPaths.map(s => `file '${s}'`).join("\n"), "utf8");
 
-  const crf = Math.max(18, Math.min(28, parseInt(renderOptions.crf) || 23));
-  const preset = renderOptions.preset || "fast";
-  const pixFmt = renderOptions.pixFmt || "yuv420p";
-  const audioBitrate = renderOptions.audioBitrate || "192k";
+  const crf = renderOptions.crf || RC.CRF;
 
   const args = [
-    "-f", "concat",
-    "-safe", "0",
-    "-i", concatFile,
-    "-threads", "4",  // ← Multi-threading
-    "-c:v", "libx264",
-    "-pix_fmt", pixFmt,
-    "-crf", String(crf),
-    "-preset", preset,
-    "-movflags", "+faststart",
-    "-c:a", "aac",
-    "-b:a", audioBitrate,
-    "-y",
-    outPath
+    "-f", "concat", "-safe", "0", "-i", concatFile,
+    "-c:v", "libx264", "-pix_fmt", RC.PIX_FMT,
+    "-crf", String(crf), "-preset", RC.PRESET,
+    "-threads", String(RC.THREADS),
+    "-movflags", RC.MOVFLAGS,
+    "-c:a", "aac", "-b:a", renderOptions.audioBitrate || RC.AUDIO_BITRATE,
+    "-y", outPath,
   ];
 
   try {
     await spawnFfmpeg(args, "simple concat");
-    console.log(`[concat] ✓ simple concat succeeded`);
   } finally {
     try { fs.unlinkSync(concatFile); } catch (_) {}
   }
 }
 
-// ================================
-// VALIDATION - Check all panels before render
-// ================================
+// ════════════════════════════════════════════════════════════════
+// Pre-render validation
+// ════════════════════════════════════════════════════════════════
 
 async function validateRenderPanels(panels) {
   const errors = [];
-
   for (let i = 0; i < panels.length; i++) {
     const p = panels[i];
-    const panelNum = i + 1;
-
+    const n = i + 1;
     if (!p.image || !fs.existsSync(path.join(p.dir, p.image))) {
-      errors.push(`Panel ${panelNum} image missing`);
-      continue;
+      errors.push(`Panel ${n} image missing`); continue;
     }
-
-    console.log(`[validate] ✓ Panel ${panelNum} image valid`);
-
     if (p.audio) {
-      const audioPath = path.join(p.dir, p.audio);
-      if (!fs.existsSync(audioPath)) {
-        errors.push(`Panel ${panelNum} missing audio`);
-        continue;
-      }
-
-      const result = await getAudioDuration(audioPath);
-      if (!result.valid) {
-        errors.push(`Panel ${panelNum} audio corrupted: ${result.reason}`);
-        continue;
-      }
-
-      console.log(`[validate] ✓ Panel ${panelNum} audio valid (${result.duration.toFixed(1)} sec)`);
+      const ap = path.join(p.dir, p.audio);
+      if (!fs.existsSync(ap)) { errors.push(`Panel ${n} audio missing`); continue; }
+      const r = await getAudioDuration(ap);
+      if (!r.valid) { errors.push(`Panel ${n} audio corrupted: ${r.reason}`); continue; }
     }
+    console.log(`[validate] ✓ panel ${n}`);
   }
-
-  if (errors.length > 0) {
-    throw new Error(`Render validation failed:\n${errors.join("\n")}`);
-  }
-
-  console.log(`[validate] ✓ All ${panels.length} panels validated successfully`);
+  if (errors.length) throw new Error(`Validation failed:\n${errors.join("\n")}`);
+  console.log(`[validate] ✓ all ${panels.length} panels OK`);
 }
 
-// ================================
-// HEALTH CHECK
-// ================================
+// ════════════════════════════════════════════════════════════════
+// Core render loop (shared by project + multipart paths)
+// ════════════════════════════════════════════════════════════════
 
-app.get("/health", (req, res) => {
+async function runRenderLoop({ jobId, panels, getImage, getAudio, getText, getDuration,
+                               renderOptions, batchIndex, totalBatches, projectId, uploadPaths = [] }) {
+  const panelCount = panels.length;
+  const segPaths   = [];
+  const durations  = [];
+  updateJob(jobId, { status: "processing", progress: 0, batchIndex, totalBatches });
+
+  try {
+    let skipped = 0;
+    for (let i = 0; i < panels.length; i++) {
+      const p       = panels[i];
+      p.index       = i;
+      const dur     = await getDuration(p);
+      const segPath = path.join(TEMP_ROOT, `seg_${jobId}_${i}.mp4`);
+
+      const result = await createSegmentSafe({
+        imagePath: getImage(p),
+        audioPath: getAudio(p),
+        text:      getText(p),
+        duration:  dur,
+        outPath:   segPath,
+        jobId, idx: i, panelCount,
+        aspectMode: renderOptions.aspectMode,
+        renderOptions,
+      });
+
+      if (result.success) { segPaths.push(segPath); durations.push(dur); }
+      else                { skipped++; console.warn(`[${jobId}] panel ${i + 1} skipped`); }
+
+      updateJob(jobId, { progress: Math.round(((i + 1) / panels.length) * 75), skipped });
+    }
+
+    if (!segPaths.length) throw new Error("All panels failed — no segments produced.");
+    if (skipped)          console.warn(`[${jobId}] ⚠ ${skipped} panels skipped`);
+
+    updateJob(jobId, { progress: 80 });
+
+    // ── concat ──────────────────────────────────────────────────
+    const mergedPath = path.join(TEMP_ROOT, `${jobId}_merged.mp4`);
+    await concatWithTransitions(segPaths, durations, mergedPath, renderOptions);
+    cleanupFiles(segPaths);
+
+    updateJob(jobId, { progress: 90 });
+
+    // ── watermark (if any) ──────────────────────────────────────
+    const finalPath = path.join(OUTPUT_ROOT, `${jobId}_final.mp4`);
+    if (renderOptions.watermarkFile && fs.existsSync(renderOptions.watermarkFile)) {
+      await applyWatermark(mergedPath, renderOptions.watermarkFile, finalPath, renderOptions);
+      try { fs.unlinkSync(mergedPath); } catch (_) {}
+    } else {
+      fs.renameSync(mergedPath, finalPath);
+    }
+
+    // cleanup uploads
+    cleanupFiles(uploadPaths);
+    if (renderOptions.watermarkFile) {
+      try { fs.unlinkSync(renderOptions.watermarkFile); } catch (_) {}
+    }
+
+    updateJob(jobId, { progress: 95 });
+
+    const host = `https://${process.env.RAILWAY_PUBLIC_DOMAIN || "localhost"}`;
+    const url  = `${host}/output/${jobId}_final.mp4`;
+
+    // Auto-delete final file after TTL
+    setTimeout(() => { try { fs.unlinkSync(finalPath); } catch (_) {} }, RC.FILE_TTL_MS);
+
+    updateJob(jobId, {
+      status: "done", progress: 100, url,
+      videoUrl: url, video_url: url, download_url: url,
+      project_id: projectId,
+      panels: panels.length, rendered: segPaths.length, skipped,
+      batchIndex, totalBatches,
+      renderer: RENDERER_NAME,
+      format: "MP4 (H264 + AAC)",
+      device_support: "Universal (iOS, Android, Chrome, Safari, Edge)",
+      fps: getFps(panelCount),
+      aspectMode: renderOptions.aspectMode,
+      watermark: !!renderOptions.watermarkFile,
+      encodingSettings: {
+        crf:            renderOptions.crf,
+        preset:         renderOptions.preset,
+        threads:        RC.THREADS,
+        audioBitrate:   renderOptions.audioBitrate,
+        audioNormalize: renderOptions.audioNormalize,
+        audioSmoothing: renderOptions.smoothAudio,
+      },
+    });
+
+    scheduleJobEviction(jobId);
+    console.log(`[${RENDERER_NAME}][${jobId}] ✓ render complete → ${url}`);
+
+  } catch (err) {
+    console.error(`[${jobId}] ❌ render error:`, err.message);
+    cleanupFiles(segPaths);
+    cleanupFiles(uploadPaths);
+    updateJob(jobId, { status: "error", error: err.message });
+    scheduleJobEviction(jobId);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+// renderFromProject  — panel-upload workflow
+// ════════════════════════════════════════════════════════════════
+
+async function renderFromProject(req, jobId) {
+  const projectId  = safeName(req.body.project_id || req.body.projectId, "");
+  if (!projectId) return updateJob(jobId, { status: "error", error: "Missing project_id" });
+
+  const projectDir = path.join(UPLOADS_ROOT, projectId);
+  if (!fs.existsSync(projectDir)) {
+    return updateJob(jobId, { status: "error", error: `No panels found for project_id ${projectId}` });
+  }
+
+  const renderOptions  = extractRenderOptions(req.body);
+  const batchIndex     = Number(req.body.batchIndex   || req.body.batch_index   || 0);
+  const totalBatches   = Number(req.body.totalBatches || req.body.total_batches || 1);
+
+  let orderedRefs = [];
+  try {
+    if (Array.isArray(req.body.panels))         orderedRefs = req.body.panels;
+    else if (typeof req.body.panels === "string") orderedRefs = JSON.parse(req.body.panels);
+  } catch (_) { orderedRefs = []; }
+
+  const readPanel = (panelId, fi) => {
+    const dir      = path.join(projectDir, safeName(panelId, `panel_${fi + 1}`));
+    const metaPath = path.join(dir, "metadata.json");
+    if (!fs.existsSync(metaPath)) return null;
+    const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+    return { ...meta, dir, index: fi };
+  };
+
+  let panels = [];
+  if (orderedRefs.length) {
+    panels = orderedRefs.map((p, i) => readPanel(p.ref || p.panel_id || p.id || p.panel, i)).filter(Boolean);
+  } else {
+    const folders = fs.readdirSync(projectDir, { withFileTypes: true })
+      .filter(d => d.isDirectory()).map(d => d.name);
+    panels = folders.map((n, i) => readPanel(n, i)).filter(Boolean);
+    panels.sort((a, b) => Number(a.index || 0) - Number(b.index || 0));
+  }
+
+  if (!panels.length) return updateJob(jobId, { status: "error", error: "No complete panels found" });
+
+  await validateRenderPanels(panels);
+
+  await runRenderLoop({
+    jobId, panels, projectId, renderOptions, batchIndex, totalBatches,
+    getImage:    p => path.join(p.dir, p.image),
+    getAudio:    p => p.audio ? path.join(p.dir, p.audio) : null,
+    getText:     p => p.narration || "",
+    getDuration: p => calculatePanelDuration(p),
+  });
+}
+
+// ════════════════════════════════════════════════════════════════
+// renderFromMultipart — direct upload workflow
+// ════════════════════════════════════════════════════════════════
+
+async function renderFromMultipart(req, jobId) {
+  const imageFiles = req.files?.images || [];
+  if (!imageFiles.length) return updateJob(jobId, { status: "error", error: "No images uploaded" });
+
+  const renderOptions = extractRenderOptions(req.body);
+  const batchIndex    = Number(req.body.batchIndex   || 0);
+  const totalBatches  = Number(req.body.totalBatches || 1);
+  const uploadPaths   = imageFiles.map(f => f.path);
+
+  // Watermark file (uploaded in this request)
+  const wmFiles = req.files?.watermark || [];
+  if (wmFiles.length) renderOptions.watermarkFile = wmFiles[0].path;
+
+  const lines = String(req.body.narration || "").split("\n").map(l => l.trim());
+  while (lines.length < imageFiles.length) lines.push("");
+
+  const panels = imageFiles.map((f, i) => ({ _file: f, _line: lines[i], _idx: i }));
+
+  await runRenderLoop({
+    jobId, panels, projectId: null, renderOptions, batchIndex, totalBatches,
+    getImage:    p => p._file.path,
+    getAudio:    _  => null,
+    getText:     p => p._line,
+    getDuration: p => {
+      const wc  = String(p._line || "").split(/\s+/).filter(Boolean).length;
+      return Promise.resolve(Math.max(3, Math.min(12, Math.round(wc / 2.3) + 1)));
+    },
+    uploadPaths,
+  });
+}
+
+// ════════════════════════════════════════════════════════════════
+// Multer storages
+// ════════════════════════════════════════════════════════════════
+
+function makeDiskStorage(dest) {
+  return multer.diskStorage({
+    destination: dest,
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname).toLowerCase() || ".bin";
+      cb(null, `${Date.now()}_${crypto.randomBytes(4).toString("hex")}${ext}`);
+    },
+  });
+}
+
+const panelUpload = multer({ storage: makeDiskStorage(UPLOADS_ROOT), limits: { fileSize: 500 * 1024 * 1024, files: 4 } });
+const diskUpload  = multer({ storage: makeDiskStorage(UPLOADS_ROOT), limits: { fileSize: 300 * 1024 * 1024, files: 3000 } });
+const zipUpload   = multer({ storage: makeDiskStorage(TEMP_ROOT),    limits: { fileSize: 500 * 1024 * 1024, files: 1 } });
+
+// ════════════════════════════════════════════════════════════════
+// ROUTES
+// ════════════════════════════════════════════════════════════════
+
+// ── Health ───────────────────────────────────────────────────────
+
+app.get("/health", (_req, res) => {
   res.json({
-    status: "ok",
-    renderer: RENDERER_NAME,
+    status: "ok", renderer: RENDERER_NAME,
     memoryMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    config: { preset: RC.PRESET, crf: RC.CRF, threads: RC.THREADS, zoompanFps: RC.ZOOMPAN_FPS },
   });
 });
 
-// ================================
-// STATUS ROUTE
-// ================================
+// ── Job status ───────────────────────────────────────────────────
 
 app.get("/status/:jobId", (req, res) => {
   const job = jobs[req.params.jobId];
-  if (!job) {
-    return res.status(404).json({ success: false, error: "Job not found" });
-  }
+  if (!job) return res.status(404).json({ success: false, error: "Job not found" });
   res.json({ success: true, ...job });
 });
 
-// ================================
-// PANEL UPLOAD ROUTE
-// ================================
+// ── Panel upload ─────────────────────────────────────────────────
 
 app.post(
   "/panel",
-  panelUpload.fields([
-    { name: "image", maxCount: 1 },
-    { name: "audio", maxCount: 1 }
-  ]),
+  panelUpload.fields([{ name: "image", maxCount: 1 }, { name: "audio", maxCount: 1 }]),
   (req, res) => {
     try {
       const projectId = safeName(req.body.project_id || req.body.projectId, "project");
-      const panelId   = safeName(req.body.panel_id || req.body.panelId || `panel_${Date.now()}`, "panel");
+      const panelId   = safeName(req.body.panel_id   || req.body.panelId   || `panel_${Date.now()}`, "panel");
       const duration  = Number(req.body.duration || 4);
       const narration = String(req.body.narration || "").trim();
 
-      if (!req.files?.image || !req.files.image[0]) {
-        return res.status(400).json({ success: false, error: "Image required" });
-      }
+      if (!req.files?.image?.[0]) return res.status(400).json({ success: false, error: "Image required" });
 
-      const projectDir = path.join(UPLOADS_ROOT, projectId);
-      const panelDir   = path.join(projectDir, panelId);
+      const panelDir = path.join(UPLOADS_ROOT, projectId, panelId);
+      fs.mkdirSync(panelDir, { recursive: true });
 
-      [projectDir, panelDir].forEach((dir) => {
-        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      });
+      const imgSrc  = req.files.image[0].path;
+      const imgDest = path.join(panelDir, "image.jpg");
+      fs.copyFileSync(imgSrc, imgDest);
+      fs.unlinkSync(imgSrc);
 
-      // FIX #1: Read from disk instead of buffer
-      const imageBuffer = fs.readFileSync(req.files.image[0].path);
-      const imagePath = path.join(panelDir, `image.jpg`);
-      fs.writeFileSync(imagePath, imageBuffer);
-      fs.unlinkSync(req.files.image[0].path); // Clean up temp file
-
-      let audioPath = null;
       let audioFileName = null;
-      if (req.files?.audio && req.files.audio[0]) {
-        const audioExt = extFor(req.files.audio[0], ".mp3");
-        audioFileName = `audio${audioExt}`;
-        audioPath = path.join(panelDir, audioFileName);
-        const audioBuffer = fs.readFileSync(req.files.audio[0].path);
-        fs.writeFileSync(audioPath, audioBuffer);
-        fs.unlinkSync(req.files.audio[0].path); // Clean up temp file
+      if (req.files?.audio?.[0]) {
+        const ext          = extFor(req.files.audio[0], ".mp3");
+        audioFileName      = `audio${ext}`;
+        const audioSrc     = req.files.audio[0].path;
+        const audioDest    = path.join(panelDir, audioFileName);
+        fs.copyFileSync(audioSrc, audioDest);
+        fs.unlinkSync(audioSrc);
       }
 
       const index = Number(req.body.index || 0);
-
-      fs.writeFileSync(
-        path.join(panelDir, "metadata.json"),
-        JSON.stringify({
-          index,
-          duration,
-          narration,
-          image:       "image.jpg",
-          audio:       audioFileName,
-          uploaded_at: new Date().toISOString()
-        }, null, 2)
-      );
+      fs.writeFileSync(path.join(panelDir, "metadata.json"), JSON.stringify(
+        { index, duration, narration, image: "image.jpg", audio: audioFileName, uploaded_at: new Date().toISOString() }, null, 2
+      ));
 
       console.log(`[panel] saved ${projectId}/${panelId}`);
-
-      return res.json({
-        success:    true,
-        panel:      panelId,
-        panel_id:   panelId,
-        ref:        panelId,
-        project_id: projectId
-      });
+      res.json({ success: true, panel: panelId, panel_id: panelId, ref: panelId, project_id: projectId });
 
     } catch (err) {
       console.error("/panel error:", err);
-      return res.status(500).json({ success: false, error: err.message });
+      res.status(500).json({ success: false, error: err.message });
     }
   }
 );
 
-// ================================
-// AUDIO ZIP UPLOAD ROUTE
-// ================================
+// ── Audio ZIP upload ─────────────────────────────────────────────
 
 app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
   try {
     const projectId = safeName(req.body.project_id || req.body.projectId, "");
-    if (!projectId) {
-      return res.status(400).json({ success: false, error: "Missing project_id" });
-    }
-
-    if (!req.file) {
-      return res.status(400).json({ success: false, error: "audioZip file required" });
-    }
+    if (!projectId) return res.status(400).json({ success: false, error: "Missing project_id" });
+    if (!req.file)  return res.status(400).json({ success: false, error: "audioZip required" });
 
     const projectDir = path.join(UPLOADS_ROOT, projectId);
-    if (!fs.existsSync(projectDir)) {
-      return res.status(404).json({ success: false, error: "Project not found. Upload panels first." });
-    }
+    if (!fs.existsSync(projectDir)) return res.status(404).json({ success: false, error: "Project not found" });
 
-    // FIX #1: Read from disk instead of memory buffer
-    const zipBuffer = fs.readFileSync(req.file.path);
-    const zip = new AdmZip(zipBuffer);
-    fs.unlinkSync(req.file.path); // Clean up temp file
-    
-    const entries = zip.getEntries();
+    const zip      = new AdmZip(req.file.path);
+    fs.unlinkSync(req.file.path);
 
-    const mp3Entries = entries
+    const mp3Entries = zip.getEntries()
       .filter(e => !e.isDirectory)
       .filter(e => {
-        const name = e.entryName.replace(/\\/g, "/");
-        if (name.includes("__MACOSX")) return false;
-        if (path.basename(name).startsWith(".")) return false;
-        return /\.mp3$/i.test(name);
+        const n = e.entryName.replace(/\\/g, "/");
+        return !n.includes("__MACOSX") && !path.basename(n).startsWith(".") && /\.mp3$/i.test(n);
       })
-      .map(e => {
-        const base = path.basename(e.entryName);
-        const match = base.match(/(\d+)/);
-        return match ? { entry: e, num: Number(match[1]), file: base } : null;
-      })
+      .map(e => { const m = path.basename(e.entryName).match(/(\d+)/); return m ? { entry: e, num: Number(m[1]), file: path.basename(e.entryName) } : null; })
       .filter(Boolean)
       .sort((a, b) => a.num - b.num);
 
-    if (!mp3Entries.length) {
-      return res.status(400).json({
-        success: false,
-        error: "No valid numbered MP3 found. Use 1.mp3, 2.mp3, 3.mp3, audio_1.mp3, panel_1.mp3, etc."
-      });
-    }
+    if (!mp3Entries.length) return res.status(400).json({ success: false, error: "No numbered MP3s found (use 1.mp3, 2.mp3 …)" });
 
-    const panelFolders = fs
-      .readdirSync(projectDir, { withFileTypes: true })
+    const panelFolders = fs.readdirSync(projectDir, { withFileTypes: true })
       .filter(d => d.isDirectory())
-      .map(d => d.name)
-      .map(name => {
-        const dir = path.join(projectDir, name);
+      .map(d => {
+        const dir      = path.join(projectDir, d.name);
         const metaPath = path.join(dir, "metadata.json");
         if (!fs.existsSync(metaPath)) return null;
         const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
-        return { name, dir, metaPath, meta };
+        return { name: d.name, dir, metaPath, meta };
       })
       .filter(Boolean)
       .sort((a, b) => Number(a.meta.index || 0) - Number(b.meta.index || 0));
 
     const attached = [];
-    const missing = [];
+    const missing  = [];
 
     for (let i = 0; i < panelFolders.length; i++) {
-      const panelNumber = i + 1;
-      const audio = mp3Entries.find(x => x.num === panelNumber);
+      const num   = i + 1;
+      const audio = mp3Entries.find(x => x.num === num);
+      if (!audio) { missing.push(num); continue; }
 
-      if (!audio) {
-        missing.push(panelNumber);
-        continue;
-      }
-
-      const panel = panelFolders[i];
-      const outAudio = path.join(panel.dir, "audio.mp3");
-
-      fs.writeFileSync(outAudio, audio.entry.getData());
-
-      panel.meta.audio = "audio.mp3";
+      const panel     = panelFolders[i];
+      const audioPath = path.join(panel.dir, "audio.mp3");
+      fs.writeFileSync(audioPath, audio.entry.getData());
+      panel.meta.audio        = "audio.mp3";
       panel.meta.audio_source = "zip";
       panel.meta.audio_original = audio.file;
-
       fs.writeFileSync(panel.metaPath, JSON.stringify(panel.meta, null, 2));
-
-      attached.push({
-        panel: panelNumber,
-        image: panel.meta.image,
-        audio: audio.file,
-        status: "attached"
-      });
+      attached.push({ panel: num, audio: audio.file, status: "attached" });
     }
 
-    return res.json({
-      success: true,
-      project_id: projectId,
-      totalPanels: panelFolders.length,
-      totalMp3Found: mp3Entries.length,
-      attached,
-      missing,
+    res.json({
+      success: true, project_id: projectId,
+      totalPanels: panelFolders.length, totalMp3Found: mp3Entries.length,
+      attached, missing,
       message: missing.length
-        ? `Attached ${attached.length} audio files. Missing audio for panels: ${missing.join(", ")}`
-        : `All ${attached.length} MP3 files attached successfully.`
+        ? `Attached ${attached.length} files. Missing: panels ${missing.join(", ")}`
+        : `All ${attached.length} MP3 files attached.`,
     });
 
   } catch (err) {
     console.error("/audio-zip error:", err);
-    return res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ================================
-// RENDER ROUTE (async background job)
-// ================================
+// ── Main render route ────────────────────────────────────────────
+//
+// Accepts:
+//   POST /render  { project_id }         → project-panel workflow
+//   POST /render  multipart images[]     → direct-upload workflow
+//
+// Watermark: upload a PNG as `watermark` field in the multipart form.
+// Options (all optional):
+//   aspectMode     = "fit" | "cinematic"
+//   audioNormalize = true/false
+//   smoothAudio    = true/false
+//   crf            = 18–32  (default 26)
+//   preset         = veryfast / fast / medium
+//   wmPosition     = bottom-right / bottom-left / top-right / top-left / center
+//   wmOpacity      = 0.0–1.0  (default 0.2)
+//   wmScale        = 0.05–0.5 (default 0.15)
+//   wmMargin       = pixels   (default 20)
 
 app.post("/render", (req, res) => {
-  const hasProjectId = req.body?.project_id || req.body?.projectId;
+  const hasProject = req.body?.project_id || req.body?.projectId;
 
-  if (hasProjectId) {
+  if (hasProject) {
     const jobId = createJob();
     res.json({ success: true, jobId, status: "queued" });
-
-    setImmediate(() => {
-      renderFromProject(req, jobId).catch((err) => {
-        console.error(`[${jobId}] Unhandled project render error:`, err.message);
+    setImmediate(() =>
+      renderFromProject(req, jobId).catch(err => {
+        console.error(`[${jobId}] unhandled:`, err.message);
         updateJob(jobId, { status: "error", error: err.message });
         scheduleJobEviction(jobId);
-      });
-    });
+      })
+    );
     return;
   }
 
-  // FIX: Change from .array() to .fields() to support overlay, watermark, etc.
   diskUpload.fields([
-    { name: "images", maxCount: 2000 },
-    { name: "overlay", maxCount: 1 },
-    { name: "overlayLogo", maxCount: 1 },
-    { name: "watermark", maxCount: 1 }
-  ])(req, res, (multerErr) => {
-    if (multerErr) {
-      console.error("[/render] Multer error:", multerErr.message);
-      return res.status(400).json({ success: false, error: multerErr.message });
-    }
-
+    { name: "images",    maxCount: 2000 },
+    { name: "watermark", maxCount: 1 },
+  ])(req, res, multerErr => {
+    if (multerErr) return res.status(400).json({ success: false, error: multerErr.message });
     const jobId = createJob();
     res.json({ success: true, jobId, status: "queued" });
-
-    setImmediate(() => {
-      renderFromMultipart(req, jobId).catch((err) => {
-        console.error(`[${jobId}] Unhandled multipart render error:`, err.message);
+    setImmediate(() =>
+      renderFromMultipart(req, jobId).catch(err => {
+        console.error(`[${jobId}] unhandled:`, err.message);
         updateJob(jobId, { status: "error", error: err.message });
         scheduleJobEviction(jobId);
-      });
-    });
+      })
+    );
   });
 });
 
-// ================================
-// ENHANCEMENT 3: Extract render options from payload
-// ================================
-
-function extractRenderOptions(body) {
-  return {
-    audioNormalize: body.audioNormalize === true || body.audioNormalize === "true",
-    loudnorm: body.loudnorm === true || body.loudnorm === "true",
-    smoothAudio: body.smoothAudio === true || body.smoothAudio === "true",
-    crf: body.crf || 23,
-    preset: body.preset || "fast",
-    maxrate: body.maxrate || "",
-    bufsize: body.bufsize || "",
-    audioBitrate: body.audioBitrate || "192k",
-    movflags: body.movflags || "+faststart",
-    pixFmt: body.pixFmt || "yuv420p",
-    videoCodec: body.videoCodec || "libx264",
-    overlay: body.overlay === true || body.overlay === "true",
-    overlayLogo: body.overlayLogo || null,
-    watermark: body.watermark || null,
-    zoom: body.zoom || null,
-    zoomFactor: body.zoomFactor || 1.0,
-    cropX: body.cropX || null,
-    cropY: body.cropY || null,
-    focusX: body.focusX || 0.5,
-    focusY: body.focusY || 0.5,
-    aspectMode: body.aspectMode || body.aspect_mode || "fit"  // ← Default to "fit" for proper aspect ratio
-  };
-}
-
-// ================================
-// Render from uploaded panels (background)
-// ================================
-
-async function renderFromProject(req, jobId) {
-  const projectId = safeName(req.body.project_id || req.body.projectId, "");
-
-  if (!projectId) {
-    return updateJob(jobId, { status: "error", error: "Missing project_id" });
-  }
-
-  const projectDir = path.join(UPLOADS_ROOT, projectId);
-
-  if (!fs.existsSync(projectDir)) {
-    return updateJob(jobId, {
-      status: "error",
-      error: `No uploaded panels found for project_id ${projectId}`
-    });
-  }
-
-  let orderedRefs = [];
-  try {
-    if (Array.isArray(req.body.panels)) {
-      orderedRefs = req.body.panels;
-    } else if (typeof req.body.panels === "string") {
-      orderedRefs = JSON.parse(req.body.panels);
-    }
-  } catch (_) {
-    orderedRefs = [];
-  }
-
-  const readPanel = (panelId, fallbackIndex) => {
-    const dir = path.join(
-      projectDir,
-      safeName(panelId, `panel_${fallbackIndex + 1}`)
-    );
-    const metaPath = path.join(dir, "metadata.json");
-    if (!fs.existsSync(metaPath)) return null;
-    const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
-    return { ...meta, dir, index: fallbackIndex };
-  };
-
-  let panels = [];
-
-  if (orderedRefs.length) {
-    panels = orderedRefs
-      .map((p, i) => readPanel(p.ref || p.panel_id || p.id || p.panel, i))
-      .filter(Boolean);
-  } else {
-    const folders = fs
-      .readdirSync(projectDir, { withFileTypes: true })
-      .filter((d) => d.isDirectory())
-      .map((d) => d.name);
-
-    panels = folders.map((name, i) => readPanel(name, i)).filter(Boolean);
-    panels.sort((a, b) => Number(a.index || 0) - Number(b.index || 0));
-  }
-
-  if (!panels.length) {
-    return updateJob(jobId, { status: "error", error: "No complete panels found to render" });
-  }
-
-  updateJob(jobId, { status: "processing", progress: 0 });
-
-  const batchIndex   = Number(req.body.batchIndex   || req.body.batch_index   || 0);
-  const totalBatches = Number(req.body.totalBatches || req.body.total_batches || 1);
-  const panelCount   = panels.length;
-  const renderOptions = extractRenderOptions(req.body);
-
-  updateJob(jobId, { batchIndex, totalBatches });
-
-  const segPaths  = [];
-  const durations = [];
-
-  try {
-    console.log(`[${RENDERER_NAME}][${jobId}] Starting validation — ${panels.length} panels`);
-    await validateRenderPanels(panels);
-
-    console.log(`[${RENDERER_NAME}][${jobId}] Starting render — ${panels.length} panels — batch ${batchIndex + 1}/${totalBatches} — panelCount=${panelCount}`);
-
-    let skipped = 0;
-    for (let i = 0; i < panels.length; i++) {
-      const p   = panels[i];
-      p.index = i;
-      const dur = await calculatePanelDuration(p);
-      const segPath = path.join(TEMP_ROOT, `seg_${jobId}_${i}.mp4`);
-
-      const result = await createSegmentSafe({
-        imagePath: path.join(p.dir, p.image),
-        audioPath: p.audio ? path.join(p.dir, p.audio) : null,
-        text:      p.narration || "",
-        duration:  dur,
-        outPath:   segPath,
-        jobId,
-        idx: i,
-        panelCount,
-        aspectMode: renderOptions.aspectMode,
-        renderOptions
-      });
-
-      if (result.success) {
-        segPaths.push(segPath);
-        durations.push(dur);
-      } else {
-        skipped++;
-        console.warn(`[${jobId}] Panel ${i + 1} skipped (${skipped} total skipped)`);
-      }
-
-      const pct = Math.round(((i + 1) / panels.length) * 80);
-      updateJob(jobId, { progress: pct, skipped });
-    }
-
-    if (!segPaths.length) {
-      throw new Error("All panels failed to render — no segments produced.");
-    }
-    if (skipped > 0) {
-      console.warn(`[${jobId}] ⚠ ${skipped} panels were skipped due to errors`);
-    }
-
-    updateJob(jobId, { progress: 85 });
-
-    const finalPath = path.join(OUTPUT_ROOT, `${jobId}_final.mp4`);
-    await concatWithTransitions(segPaths, durations, finalPath, renderOptions);
-    cleanupFiles(segPaths);
-
-    const host = `https://${process.env.RAILWAY_PUBLIC_DOMAIN || req.get("host")}`;
-    const url  = `${host}/output/${jobId}_final.mp4`;
-
-    setTimeout(() => {
-      try { fs.unlinkSync(finalPath); } catch (_) {}
-    }, 2 * 60 * 60 * 1000);
-
-    updateJob(jobId, {
-      status: "done",
-      progress: 100,
-      url,
-      videoUrl: url,
-      video_url: url,
-      download_url: url,
-      project_id: projectId,
-      panels: panels.length,
-      rendered: segPaths.length,
-      skipped,
-      batchIndex,
-      totalBatches,
-      renderer: RENDERER_NAME,
-      format: "MP4 (H264 Video + AAC Audio)",
-      device_support: "Universal (iOS, Android, Chrome, Safari, Edge)",
-      fps: getFps(panelCount),
-      aspectMode: renderOptions.aspectMode,
-      encodingSettings: {
-        crf: renderOptions.crf,
-        preset: renderOptions.preset,
-        audioNormalize: renderOptions.audioNormalize,
-        audioSmoothing: renderOptions.smoothAudio
-      }
-    });
-
-    scheduleJobEviction(jobId);
-    console.log(`[${RENDERER_NAME}][${jobId}] Render complete → ${url}`);
-
-  } catch (err) {
-    console.error(`[${jobId}] Render ERROR:`, err.message);
-    cleanupFiles(segPaths);
-    updateJob(jobId, { status: "error", error: err.message });
-    scheduleJobEviction(jobId);
-  }
-}
-
-// ================================
-// Render from multipart upload (background)
-// ================================
-
-async function renderFromMultipart(req, jobId) {
-  const segPaths    = [];
-  const durations   = [];
-  
-  // FIX: Use req.files.images array instead of req.files (because .fields() changes structure)
-  const imageFiles = req.files.images || [];
-  const uploadPaths = imageFiles.map((f) => f.path);
-
-  if (!imageFiles?.length) {
-    return updateJob(jobId, { status: "error", error: "No images uploaded." });
-  }
-
-  updateJob(jobId, { status: "processing", progress: 0 });
-
-  const batchIndex   = Number(req.body.batchIndex   || req.body.batch_index   || 0);
-  const totalBatches = Number(req.body.totalBatches || req.body.total_batches || 1);
-  const panelCount   = imageFiles.length;
-  const renderOptions = extractRenderOptions(req.body);
-
-  updateJob(jobId, { batchIndex, totalBatches });
-
-  try {
-    const lines = String(req.body.narration || "")
-      .split("\n")
-      .map((l) => l.trim());
-
-    while (lines.length < imageFiles.length) lines.push("");
-
-    console.log(`[${RENDERER_NAME}][${jobId}] Starting multipart render — ${imageFiles.length} images — batch ${batchIndex + 1}/${totalBatches}`);
-
-    let skipped = 0;
-    for (let i = 0; i < imageFiles.length; i++) {
-      const segPath  = path.join(TEMP_ROOT, `seg_${jobId}_${i}.mp4`);
-      const wordCount = String(lines[i] || "").split(/\s+/).filter(Boolean).length;
-      const dur = Math.max(3, Math.min(12, Math.round(wordCount / 2.3) + 1));
-
-      const result = await createSegmentSafe({
-        imagePath: imageFiles[i].path,
-        audioPath: null,
-        text:      lines[i] || "",
-        duration:  dur,
-        outPath:   segPath,
-        jobId,
-        idx: i,
-        panelCount,
-        aspectMode: renderOptions.aspectMode,
-        renderOptions
-      });
-
-      if (result.success) {
-        segPaths.push(segPath);
-        durations.push(dur);
-      } else {
-        skipped++;
-        console.warn(`[${jobId}] Panel ${i + 1} skipped (${skipped} total skipped)`);
-      }
-
-      const pct = Math.round(((i + 1) / imageFiles.length) * 80);
-      updateJob(jobId, { progress: pct, skipped });
-    }
-
-    if (!segPaths.length) {
-      throw new Error("All panels failed to render — no segments produced.");
-    }
-    if (skipped > 0) {
-      console.warn(`[${jobId}] ⚠ ${skipped} panels were skipped due to errors`);
-    }
-
-    updateJob(jobId, { progress: 85 });
-
-    const finalPath = path.join(OUTPUT_ROOT, `${jobId}_final.mp4`);
-    await concatWithTransitions(segPaths, durations, finalPath, renderOptions);
-    cleanupFiles([...segPaths, ...uploadPaths]);
-
-    const host = `https://${process.env.RAILWAY_PUBLIC_DOMAIN || req.get("host")}`;
-    const url  = `${host}/output/${jobId}_final.mp4`;
-
-    setTimeout(() => {
-      try { fs.unlinkSync(finalPath); } catch (_) {}
-    }, 2 * 60 * 60 * 1000);
-
-    updateJob(jobId, {
-      status: "done",
-      progress: 100,
-      url,
-      videoUrl: url,
-      video_url: url,
-      download_url: url,
-      panels: imageFiles.length,
-      rendered: segPaths.length,
-      skipped,
-      batchIndex,
-      totalBatches,
-      renderer: RENDERER_NAME,
-      format: "MP4 (H264 Video + AAC Audio)",
-      device_support: "Universal (iOS, Android, Chrome, Safari, Edge)",
-      fps: getFps(panelCount),
-      aspectMode: renderOptions.aspectMode,
-      encodingSettings: {
-        crf: renderOptions.crf,
-        preset: renderOptions.preset,
-        audioNormalize: renderOptions.audioNormalize,
-        audioSmoothing: renderOptions.smoothAudio
-      }
-    });
-
-    scheduleJobEviction(jobId);
-    console.log(`[${RENDERER_NAME}][${jobId}] Multipart render complete → ${url}`);
-
-  } catch (err) {
-    console.error(`[${jobId}] Multipart render ERROR:`, err.message);
-    cleanupFiles([...segPaths, ...uploadPaths]);
-    updateJob(jobId, { status: "error", error: err.message });
-    scheduleJobEviction(jobId);
-  }
-}
-
-// ================================
-// 404
-// ================================
+// ── 404 ──────────────────────────────────────────────────────────
 
 app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    error:   "Route not found",
-    path:    req.originalUrl
-  });
+  res.status(404).json({ success: false, error: "Route not found", path: req.originalUrl });
 });
 
-// ================================
-// Auto Cleanup (every 30 min)
-// ================================
+// ════════════════════════════════════════════════════════════════
+// Auto cleanup (every 30 min) — delete files older than FILE_TTL
+// ════════════════════════════════════════════════════════════════
 
 setInterval(() => {
   const now = Date.now();
-
-  [OUTPUT_ROOT, TEMP_ROOT].forEach((dir) => {
+  [OUTPUT_ROOT, TEMP_ROOT].forEach(dir => {
     try {
-      fs.readdirSync(dir).forEach((file) => {
+      fs.readdirSync(dir).forEach(file => {
         const full = path.join(dir, file);
         try {
           const stat = fs.statSync(full);
-          if (now - stat.mtimeMs > 2 * 60 * 60 * 1000) {
+          if (now - stat.mtimeMs > RC.FILE_TTL_MS) {
             fs.unlinkSync(full);
-            console.log(`[cleanup] Deleted old file: ${file}`);
+            console.log(`[cleanup] deleted ${file}`);
           }
         } catch (_) {}
       });
     } catch (_) {}
   });
-}, 30 * 60 * 1000);
+}, RC.CLEANUP_INT);
 
-// ================================
-// START
-// ================================
+// ════════════════════════════════════════════════════════════════
+// Start
+// ════════════════════════════════════════════════════════════════
 
 const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`ScriptReel running on port ${PORT}`);
-  console.log(`Renderer: ${RENDERER_NAME}`);
-  console.log(`FFmpeg: ${FFMPEG_PATH}`);
+  console.log(`\n🎬 ScriptReel / ${RENDERER_NAME} — port ${PORT}`);
+  console.log(`   FFmpeg  : ${FFMPEG_PATH}`);
+  console.log(`   Preset  : ${RC.PRESET}  CRF: ${RC.CRF}  Threads: ${RC.THREADS}`);
+  console.log(`   ZoompanFPS: ${RC.ZOOMPAN_FPS}  ZoomAmt: ${RC.ZOOM_AMOUNT}`);
+  console.log(`   Watermark defaults: ${RC.WM_POSITION} opacity=${RC.WM_OPACITY} scale=${RC.WM_SCALE}\n`);
 });
 
-// FIX #4: Add Upload Timeout Safety
-server.timeout = 0;
+server.timeout = 0; // no request timeout — renders can take minutes
