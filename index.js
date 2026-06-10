@@ -34,8 +34,8 @@ const RC = {
 
   // Zoom — strong enough to be visible, cinematic
   ZOOM_AMOUNT:   1.10,        // 10 % zoom — clearly visible cinematic motion
-  PAN_PIXELS:    30,          // larger pan offset for visible slide movement
-  PAN_PIXELS_Y:  20,
+  PAN_PIXELS:    18,          // balanced pan — visible but not drifting too hard on portrait panels
+  PAN_PIXELS_Y:  12,
 
   // Concat
   BATCH_SIZE:    50,          // segments per batch in recursive merge
@@ -292,38 +292,55 @@ function validateSegment(segPath) {
 // ════════════════════════════════════════════════════════════════
 //
 // FIT MODE     — full image visible, black letterbox, no zoompan
-// CINEMATIC    — 10% zoom + strong pan; internal fps = RC.ZOOMPAN_FPS
+// CINEMATIC    — 10% zoom + pan; internal fps = RC.ZOOMPAN_FPS
 //
-// Correct filter order: scale → zoompan → format
-// zoompan operates AFTER scale so it works on the final WxH frame.
+// CORRECT filter order for cinematic:
+//   scale (to WxH, preserve AR) → zoompan (zoom on image only) → pad (add black bars) → format
+//
+// WHY: zoompan must run on the unpadded image so black bars are
+// excluded from the zoom animation. Padding AFTER zoompan means the
+// bars stay static at the edges — no strange border motion.
+//
+// FIT order: scale → pad → setsar (no motion)
 // No -r output override — zoompan fps= controls output rate internally.
 // ════════════════════════════════════════════════════════════════
 
+// Scale image to fit inside WxH preserving aspect ratio — NO pad yet
+function buildScaleOnlyFilter() {
+  return `scale=${RC.W}:${RC.H}:force_original_aspect_ratio=decrease:flags=lanczos,setsar=1`;
+}
+
+// Full fit filter (scale + pad) — used for non-cinematic mode
 function buildScaleFilter() {
-  // High-quality Lanczos scaling into a black-padded 1280×720 frame
   return `scale=${RC.W}:${RC.H}:force_original_aspect_ratio=decrease:flags=lanczos,` +
          `pad=${RC.W}:${RC.H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
+}
+
+// Pad to WxH after zoompan — keeps black bars outside the zoom
+function buildPadFilter() {
+  return `pad=${RC.W}:${RC.H}:(ow-iw)/2:(oh-ih)/2:color=black`;
 }
 
 function getKenBurnsFilter(idx, duration, panelCount, aspectMode) {
   const fps    = RC.ZOOMPAN_FPS;                           // 24 — smooth motion
   const frames = Math.max(1, Math.ceil(duration * fps));
   const z      = RC.ZOOM_AMOUNT;                           // 1.10
-  const px     = RC.PAN_PIXELS;                            // 30px
-  const py     = RC.PAN_PIXELS_Y;                          // 20px
+  const px     = RC.PAN_PIXELS;                            // 18px
+  const py     = RC.PAN_PIXELS_Y;                          // 12px
   const WH     = `${RC.W}x${RC.H}`;
-  const scale  = buildScaleFilter();
 
   const mode = String(aspectMode || "fit").toLowerCase().trim();
 
   if (mode !== "cinematic") {
-    // FIT: no zoompan — scale + pad only, no motion
-    return scale;
+    // FIT: no zoompan — scale + pad + setsar, no motion
+    return buildScaleFilter();
   }
 
-  // CINEMATIC: strong visible motion — 5 patterns round-robin
-  // Order: scale → zoompan → format=yuv420p
-  // zoompan x/y keep image centred while zoom/pan progresses.
+  // CINEMATIC: correct order — scale → zoompan → pad → format
+  // zoompan runs on the scaled (but NOT yet padded) image so black
+  // bars are never included inside the zoom region.
+  const scaleOnly = buildScaleOnlyFilter();
+  const pad       = buildPadFilter();
 
   // Safe centre expressions — prevent going out of bounds
   const cx = `iw/2-(iw/zoom/2)`;
@@ -337,7 +354,7 @@ function getKenBurnsFilter(idx, duration, panelCount, aspectMode) {
     // 0: zoom-in from centre (1.0 → z)
     `zoompan=z='min(1+on*(${z}-1)/${frames},${z})':x='${cx}':y='${cy}':d=${frames}:s=${WH}:fps=${fps}`,
 
-    // 1: zoom-out from z → 1.0
+    // 1: zoom-out from centre (z → 1.0)
     `zoompan=z='max(${z}-on*(${z}-1)/${frames},1.001)':x='${cx}':y='${cy}':d=${frames}:s=${WH}:fps=${fps}`,
 
     // 2: zoom-in + pan left-to-right
@@ -351,8 +368,8 @@ function getKenBurnsFilter(idx, duration, panelCount, aspectMode) {
   ];
 
   const chosenPan = patterns[idx % patterns.length];
-  // Correct order: scale → zoompan → format (no pad between zoompan and format)
-  return `${scale},${chosenPan},format=yuv420p`;
+  // CORRECT ORDER: scale (image only) → zoompan → pad (black bars outside zoom) → format
+  return `${scaleOnly},${chosenPan},${pad},format=yuv420p`;
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -607,7 +624,7 @@ async function applyWatermark(inputPath, watermarkPath, outputPath, renderOption
     "-crf",  String(crf),
     "-preset", RC.PRESET,
     "-threads", String(RC.THREADS),
-    "-c:a", "copy",
+    "-c:a", "aac", "-b:a", RC.AUDIO_BITRATE,   // transcode → universal (opus/pcm/copy all fail on mobile)
     "-movflags", RC.MOVFLAGS,
     "-y",
     outputPath,
@@ -760,13 +777,22 @@ async function validateRenderPanels(panels) {
     if (!p.image || !fs.existsSync(path.join(p.dir, p.image))) {
       errors.push(`Panel ${n} image missing`); continue;
     }
+    // Validate image is readable and has usable dimensions
+    const imgPath = path.join(p.dir, p.image);
+    const imgInfo = await getImageDimensions(imgPath);
+    if (!imgInfo.valid) {
+      errors.push(`Panel ${n} image corrupted or unreadable: ${path.basename(imgPath)}`); continue;
+    }
+    if (imgInfo.width < 16 || imgInfo.height < 16) {
+      errors.push(`Panel ${n} image too small (${imgInfo.width}×${imgInfo.height}) — minimum 16×16`); continue;
+    }
     if (p.audio) {
       const ap = path.join(p.dir, p.audio);
       if (!fs.existsSync(ap)) { errors.push(`Panel ${n} audio missing`); continue; }
       const r = await getAudioDuration(ap);
       if (!r.valid) { errors.push(`Panel ${n} audio corrupted: ${r.reason}`); continue; }
     }
-    console.log(`[validate] ✓ panel ${n}`);
+    console.log(`[validate] ✓ panel ${n} (${imgInfo.width}×${imgInfo.height})`);
   }
   if (errors.length) throw new Error(`Validation failed:\n${errors.join("\n")}`);
   console.log(`[validate] ✓ all ${panels.length} panels OK`);
@@ -805,6 +831,9 @@ async function runRenderLoop({ jobId, panels, getImage, getAudio, getText, getDu
       if (result.success) { segPaths.push(segPath); durations.push(dur); }
       else                { skipped++; console.warn(`[${jobId}] panel ${i + 1} skipped`); }
 
+      // Hint V8 GC on large/cinematic renders — helps Railway stability at 500+ panels
+      global.gc?.();
+
       updateJob(jobId, { progress: Math.round(((i + 1) / panels.length) * 75), skipped });
     }
 
@@ -823,8 +852,16 @@ async function runRenderLoop({ jobId, panels, getImage, getAudio, getText, getDu
     // ── watermark (if any) ──────────────────────────────────────
     const finalPath = path.join(OUTPUT_ROOT, `${jobId}_final.mp4`);
     if (renderOptions.watermarkFile && fs.existsSync(renderOptions.watermarkFile)) {
-      await applyWatermark(mergedPath, renderOptions.watermarkFile, finalPath, renderOptions);
-      try { fs.unlinkSync(mergedPath); } catch (_) {}
+      try {
+        await applyWatermark(mergedPath, renderOptions.watermarkFile, finalPath, renderOptions);
+        try { fs.unlinkSync(mergedPath); } catch (_) {}
+        console.log(`[${jobId}] ✓ watermark applied`);
+      } catch (wmErr) {
+        // Watermark failed — fall back to the clean merged video rather than crashing
+        console.warn(`[${jobId}] ⚠ watermark failed (${wmErr.message.split("\n")[0]}) — using unwatermarked video`);
+        try { fs.unlinkSync(finalPath); } catch (_) {}     // remove partial output if any
+        fs.renameSync(mergedPath, finalPath);
+      }
     } else {
       fs.renameSync(mergedPath, finalPath);
     }
