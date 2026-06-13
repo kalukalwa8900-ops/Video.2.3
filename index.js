@@ -451,6 +451,23 @@ function getKenBurnsFilter(idx, duration, panelCount = 1, aspectMode = "fit") {
     return animations[idx % animations.length];
   }
 
+  if (normalised === "blurpad" || normalised === "blur-pad" || normalised === "blur_pad") {
+    // BLUR-PAD MODE — original image centred at native ratio over a heavily
+    // blurred, scaled copy of itself. No distortion, no black bars.
+    // Ken Burns is applied to the foreground only; the blurred bg is static.
+    const animations = [
+      // 1. Zoom IN foreground
+      `split[bg][fg];[bg]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,gblur=sigma=22,eq=brightness=-0.05[bg2];[fg]scale=2560:-1,zoompan=z='min(zoom+0.0009,1.18)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,scale=1280:720:force_original_aspect_ratio=decrease[fg2];[bg2][fg2]overlay=(W-w)/2:(H-h)/2,setsar=1`,
+      // 2. Zoom OUT foreground
+      `split[bg][fg];[bg]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,gblur=sigma=22,eq=brightness=-0.05[bg2];[fg]scale=2560:-1,zoompan=z='if(lte(on,1),1.18,max(zoom-0.0009,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,scale=1280:720:force_original_aspect_ratio=decrease[fg2];[bg2][fg2]overlay=(W-w)/2:(H-h)/2,setsar=1`,
+      // 3. Slide LEFT
+      `split[bg][fg];[bg]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,gblur=sigma=22,eq=brightness=-0.05[bg2];[fg]scale=2560:-1,zoompan=z='1.12':x='if(lte(on,1),iw*0.10,min(x+iw*0.06/${totalFrames},iw*0.16))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,scale=1280:720:force_original_aspect_ratio=decrease[fg2];[bg2][fg2]overlay=(W-w)/2:(H-h)/2,setsar=1`,
+      // 4. Slide RIGHT
+      `split[bg][fg];[bg]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,gblur=sigma=22,eq=brightness=-0.05[bg2];[fg]scale=2560:-1,zoompan=z='1.12':x='if(lte(on,1),iw*0.16,max(x-iw*0.06/${totalFrames},iw*0.10))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,scale=1280:720:force_original_aspect_ratio=decrease[fg2];[bg2][fg2]overlay=(W-w)/2:(H-h)/2,setsar=1`,
+    ];
+    return animations[idx % animations.length];
+  }
+
   // Default: static fit (fastest, no animation)
   return `scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`;
 }
@@ -485,10 +502,14 @@ function buildVideoFilterChain(options = {}, baseFilter = "") {
   // Optional zoom/crop adjustments (subtle, not aggressive)
   if (options.zoom || options.zoomFactor || options.cropX || options.cropY) {
     const zoomFactor = parseFloat(options.zoomFactor || options.zoom || 1.0);
-    if (zoomFactor > 1.0 && zoomFactor <= 1.15) {  // ← Limited to max 15% zoom
-      const centerX = Math.max(0, parseFloat(options.focusX || 0.5) * 1280);
-      const centerY = Math.max(0, parseFloat(options.focusY || 0.5) * 720);
-      filters.push(`zoom=z=${zoomFactor}:x='${centerX}':y='${centerY}'`);
+    if (zoomFactor > 1.0 && zoomFactor <= 3.0) {
+      const fx = Math.max(0, Math.min(1, parseFloat(options.focusX || 0.5)));
+      const fy = Math.max(0, Math.min(1, parseFloat(options.focusY || 0.5)));
+      const cw = Math.round(1280 / zoomFactor);
+      const ch = Math.round(720  / zoomFactor);
+      const cx = Math.round((1280 - cw) * fx);
+      const cy = Math.round((720  - ch) * fy);
+      filters.push(`crop=${cw}:${ch}:${cx}:${cy},scale=1280:720`);
     }
   }
   
@@ -504,13 +525,16 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
     const FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
     const wrapped = wrapText(text);
     const kenBurns = getKenBurnsFilter(idx, duration, panelCount, aspectMode);
-    
+
     const vfParts = [
       buildVideoFilterChain(renderOptions, kenBurns),
       "setsar=1"
     ];
 
     const hasAudio = audioPath && fs.existsSync(audioPath);
+    const overlayPath = renderOptions.overlayPath && fs.existsSync(renderOptions.overlayPath)
+      ? renderOptions.overlayPath : null;
+    const overlayMeta = renderOptions.overlay || null;
 
     const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
     console.log(`[${RENDERER_NAME}][seg${idx}] START — jobId=${jobId} mode=${aspectMode} dur=${duration}s panelCount=${panelCount} mem=${memMB}MB`);
@@ -518,7 +542,7 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
     const cmd = ffmpeg()
       .setFfmpegPath(FFMPEG_PATH)
       .input(imagePath)
-      .inputOptions(["-loop 1", "-framerate 15"]);  // ← 15fps input matches output
+      .inputOptions(["-loop 1", "-framerate 15"]);
 
     if (hasAudio) {
       cmd.input(audioPath);
@@ -526,6 +550,11 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
       cmd
         .input(`aevalsrc=0:channel_layout=stereo:sample_rate=44100:duration=${duration}`)
         .inputOptions(["-f lavfi"]);
+    }
+
+    // Optional channel branding overlay (PNG with alpha)
+    if (overlayPath) {
+      cmd.input(overlayPath);
     }
 
     // Speed-optimised quality settings
@@ -539,8 +568,31 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
     const movflags     = renderOptions.movflags ? String(renderOptions.movflags) : "+faststart";
 
     // No loudnorm — removed for speed; audio passed through clean
+    // Build the video filter pipeline. If an overlay is attached, switch
+    // from -vf to -filter_complex so we can composite the watermark.
+    let videoFilterFlag = ["-vf", vfParts.join(",")];
+    if (overlayPath) {
+      const pos = overlayMeta?.position || "top-right";
+      const sizePct = Math.max(3, Math.min(40, Number(overlayMeta?.sizePct ?? 12)));
+      const margin  = Math.max(0, Math.min(200, Number(overlayMeta?.marginPx ?? 16)));
+      const opacity = Math.max(0.05, Math.min(1, Number(overlayMeta?.opacity ?? 1)));
+      const wmW = Math.round(1280 * sizePct / 100);
+
+      let xExpr, yExpr;
+      if (pos === "top-left")          { xExpr = String(margin);                 yExpr = String(margin); }
+      else if (pos === "bottom-left")  { xExpr = String(margin);                 yExpr = `H-h-${margin}`; }
+      else if (pos === "bottom-right") { xExpr = `W-w-${margin}`;              yExpr = `H-h-${margin}`; }
+      else                              { xExpr = `W-w-${margin}`;              yExpr = String(margin); }
+
+      const complex =
+        `[0:v]${vfParts.join(",")}[bgv];` +
+        `[2:v]scale=${wmW}:-1,format=rgba,colorchannelmixer=aa=${opacity}[wm];` +
+        `[bgv][wm]overlay=${xExpr}:${yExpr}:format=auto[outv]`;
+      videoFilterFlag = ["-filter_complex", complex, "-map", "[outv]", "-map", "1:a?"];
+    }
+
     const outputOpts = [
-      `-vf ${vfParts.join(",")}`,
+      ...videoFilterFlag,
       `-c:v ${videoCodec}`,
       `-pix_fmt ${pixFmt}`,
       `-r 15`,           // ← 15 fps output
@@ -833,6 +885,13 @@ app.post(
 
       const index = Number(req.body.index || 0);
 
+      // Per-panel manual zoom/crop (frontend sends 0-100 % focus or 0-1)
+      const zoomVal = Math.max(1, Math.min(3, Number(req.body.zoom || req.body.zoomFactor || 1)));
+      const rawFX = Number(req.body.focusX != null ? req.body.focusX : req.body.cropX);
+      const rawFY = Number(req.body.focusY != null ? req.body.focusY : req.body.cropY);
+      const focusX = Number.isFinite(rawFX) ? (rawFX > 1 ? rawFX / 100 : rawFX) : 0.5;
+      const focusY = Number.isFinite(rawFY) ? (rawFY > 1 ? rawFY / 100 : rawFY) : 0.5;
+
       fs.writeFileSync(
         path.join(panelDir, "metadata.json"),
         JSON.stringify({
@@ -841,6 +900,9 @@ app.post(
           narration,
           image:       "image.jpg",
           audio:       audioFileName,
+          zoom:        zoomVal,
+          focusX,
+          focusY,
           uploaded_at: new Date().toISOString()
         }, null, 2)
       );
@@ -979,7 +1041,34 @@ app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
 // RENDER ROUTE (async background job)
 // ================================
 
-app.post("/render", (req, res) => {
+// Multer for an optional overlay PNG attached to /render
+const overlayUpload = multer({
+  storage: multer.diskStorage({
+    destination: UPLOADS_ROOT,
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname).toLowerCase() || ".png";
+      cb(null, `overlay_${Date.now()}_${crypto.randomBytes(4).toString("hex")}${ext}`);
+    }
+  }),
+  limits: { fileSize: 20 * 1024 * 1024 }
+});
+
+function handleRender(req, res) {
+  // If a "payload" JSON field was sent alongside multipart, merge it into req.body
+  if (req.body && typeof req.body.payload === "string") {
+    try {
+      const parsed = JSON.parse(req.body.payload);
+      for (const k of Object.keys(parsed)) {
+        if (req.body[k] == null) req.body[k] = parsed[k];
+      }
+    } catch (_) {}
+  }
+  // Stash overlay file path on req (if uploaded)
+  if (req.files) {
+    const f = req.files.overlay?.[0] || req.files.overlayLogo?.[0] || req.files.watermark?.[0];
+    if (f) req._overlayPath = f.path;
+  }
+
   const hasProjectId = req.body?.project_id || req.body?.projectId;
 
   if (hasProjectId) {
@@ -1016,6 +1105,28 @@ app.post("/render", (req, res) => {
       });
     });
   });
+}
+
+// Accept /render as either:
+//   - application/json                 -> handleRender directly
+//   - multipart/form-data (overlay)    -> parse overlay+fields, then handleRender
+app.post("/render", (req, res) => {
+  const ct = String(req.headers["content-type"] || "");
+  if (ct.includes("multipart/form-data")) {
+    overlayUpload.fields([
+      { name: "overlay",     maxCount: 1 },
+      { name: "overlayLogo", maxCount: 1 },
+      { name: "watermark",   maxCount: 1 }
+    ])(req, res, (err) => {
+      if (err) {
+        console.error("[/render] overlay multer error:", err.message);
+        return res.status(400).json({ success: false, error: err.message });
+      }
+      handleRender(req, res);
+    });
+  } else {
+    handleRender(req, res);
+  }
 });
 
 // ================================
@@ -1023,6 +1134,28 @@ app.post("/render", (req, res) => {
 // ================================
 
 function extractRenderOptions(body) {
+  // Map frontend outputFit -> backend aspectMode
+  //   "cover"    -> "cinematic"  (fills frame; allows crop)
+  //   "contain"  -> "fit"        (letterbox, full image visible)
+  //   "blur-pad" -> "blurpad"    (blurred-scaled bg + full image overlay)
+  let aspectMode = String(body.aspectMode || body.aspect_mode || "").toLowerCase();
+  if (!aspectMode) {
+    const fit = String(body.outputFit || body.output_fit || body.fit || "").toLowerCase();
+    if (fit === "blur-pad" || String(body.padMode || body.pad_mode || "").toLowerCase() === "blur" || body.blurBackground === true || body.blur_background === true || body.blurBackground === "true" || body.blur_background === "true") {
+      aspectMode = "blurpad";
+    } else if (fit === "contain") aspectMode = "fit";
+    else if (fit === "cover")    aspectMode = "cinematic";
+    else aspectMode = "fit";
+  }
+
+  // Overlay/watermark metadata
+  let overlay = null;
+  try {
+    const raw = body.overlay || body.overlayMeta;
+    if (raw) overlay = typeof raw === "string" ? JSON.parse(raw) : raw;
+  } catch (_) { overlay = null; }
+  if (overlay && (overlay.enabled === false || overlay.enabled === "false")) overlay = null;
+
   return {
     smoothAudio:   body.smoothAudio === true || body.smoothAudio === "true",
     crf:           body.crf || 21,
@@ -1039,7 +1172,8 @@ function extractRenderOptions(body) {
     cropY:         body.cropY || null,
     focusX:        body.focusX || 0.5,
     focusY:        body.focusY || 0.5,
-    aspectMode:    body.aspectMode || body.aspect_mode || "fit"
+    aspectMode,
+    overlay
   };
 }
 
@@ -1111,6 +1245,9 @@ async function renderFromProject(req, jobId) {
   const totalBatches = Number(req.body.totalBatches || req.body.total_batches || 1);
   const panelCount   = panels.length;
   const renderOptions = extractRenderOptions(req.body);
+  if (req._overlayPath && fs.existsSync(req._overlayPath)) {
+    renderOptions.overlayPath = req._overlayPath;
+  }
 
   updateJob(jobId, { batchIndex, totalBatches });
 
@@ -1130,6 +1267,13 @@ async function renderFromProject(req, jobId) {
       const dur = await calculatePanelDuration(p);
       const segPath = path.join(TEMP_ROOT, `seg_${jobId}_${i}.mp4`);
 
+      const perPanelOpts = {
+        ...renderOptions,
+        zoomFactor: Number(p.zoom || 1),
+        focusX:     Number(p.focusX != null ? p.focusX : 0.5),
+        focusY:     Number(p.focusY != null ? p.focusY : 0.5)
+      };
+
       const result = await createSegmentSafe({
         imagePath: path.join(p.dir, p.image),
         audioPath: p.audio ? path.join(p.dir, p.audio) : null,
@@ -1140,7 +1284,7 @@ async function renderFromProject(req, jobId) {
         idx: i,
         panelCount,
         aspectMode: renderOptions.aspectMode,
-        renderOptions
+        renderOptions: perPanelOpts
       });
 
       if (result.success) {
