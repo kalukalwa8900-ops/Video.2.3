@@ -526,13 +526,10 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
     const wrapped = wrapText(text);
     const kenBurns = getKenBurnsFilter(idx, duration, panelCount, aspectMode);
 
-    // BLUR-PAD uses filter_complex syntax (split / named labels / ';').
-    // Detect it and route through -filter_complex instead of -vf, since -vf
-    // only accepts a single linear filterchain (comma-separated).
-    const isComplex = /;|\[[a-zA-Z0-9_]+\]/.test(kenBurns);
-    const vfParts = isComplex
-      ? [kenBurns] // already includes setsar; do NOT post-process with buildVideoFilterChain
-      : [buildVideoFilterChain(renderOptions, kenBurns), "setsar=1"];
+    const vfParts = [
+      buildVideoFilterChain(renderOptions, kenBurns),
+      "setsar=1"
+    ];
 
     const hasAudio = audioPath && fs.existsSync(audioPath);
     const overlayPath = renderOptions.overlayPath && fs.existsSync(renderOptions.overlayPath)
@@ -571,10 +568,9 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
     const movflags     = renderOptions.movflags ? String(renderOptions.movflags) : "+faststart";
 
     // No loudnorm — removed for speed; audio passed through clean
-    // Build the video filter pipeline. If an overlay is attached OR the
-    // ken-burns filter is itself a filter_complex graph (blur-pad), we must
-    // use -filter_complex so the graph composes correctly.
-    let videoFilterFlag;
+    // Build the video filter pipeline. If an overlay is attached, switch
+    // from -vf to -filter_complex so we can composite the watermark.
+    let videoFilterFlag = ["-vf", vfParts.join(",")];
     if (overlayPath) {
       const pos = overlayMeta?.position || "top-right";
       const sizePct = Math.max(3, Math.min(40, Number(overlayMeta?.sizePct ?? 12)));
@@ -588,27 +584,11 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
       else if (pos === "bottom-right") { xExpr = `W-w-${margin}`;              yExpr = `H-h-${margin}`; }
       else                              { xExpr = `W-w-${margin}`;              yExpr = String(margin); }
 
-      // Build the base graph that produces [bgv]
-      let baseGraph;
-      if (isComplex) {
-        // kenBurns already declares [bg],[fg],[bg2],[fg2] internally and ends
-        // with an overlay producing an UNLABELED final pad. We need to label
-        // it so we can chain the watermark overlay onto it.
-        baseGraph = `[0:v]${kenBurns}[bgv]`;
-      } else {
-        baseGraph = `[0:v]${vfParts.join(",")}[bgv]`;
-      }
       const complex =
-        `${baseGraph};` +
+        `[0:v]${vfParts.join(",")}[bgv];` +
         `[2:v]scale=${wmW}:-1,format=rgba,colorchannelmixer=aa=${opacity}[wm];` +
         `[bgv][wm]overlay=${xExpr}:${yExpr}:format=auto[outv]`;
       videoFilterFlag = ["-filter_complex", complex, "-map", "[outv]", "-map", "1:a?"];
-    } else if (isComplex) {
-      // No watermark, but the graph itself is complex — wrap in filter_complex.
-      const complex = `[0:v]${kenBurns}[outv]`;
-      videoFilterFlag = ["-filter_complex", complex, "-map", "[outv]", "-map", "1:a?"];
-    } else {
-      videoFilterFlag = ["-vf", vfParts.join(",")];
     }
 
     const outputOpts = [
