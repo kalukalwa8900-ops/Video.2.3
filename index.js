@@ -472,6 +472,25 @@ function getKenBurnsFilter(idx, duration, panelCount = 1, aspectMode = "fit") {
   return `scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`;
 }
 
+// ================================
+// ENHANCEMENT 1: Build FFmpeg audio filter chain with smooth normalization
+// ================================
+
+function buildAudioFilterChain(options = {}) {
+  const filters = [];
+  
+  // Audio normalization for consistent loudness
+  if (options.audioNormalize || options.loudnorm) {
+    filters.push("loudnorm=I=-16:TP=-1.5:LRA=11");
+  }
+  
+  // Optional: Add gentle compression for smooth transitions
+  if (options.smoothAudio) {
+    filters.push("acompressor=threshold=0.05:ratio=4:attack=5:release=50");
+  }
+  
+  return filters.length ? filters.join(",") : "";
+}
 
 // ================================
 // ENHANCEMENT 2: Build FFmpeg video filter chain with quality optimization
@@ -1158,6 +1177,7 @@ function extractRenderOptions(body) {
   if (overlay && (overlay.enabled === false || overlay.enabled === "false")) overlay = null;
 
   return {
+    smoothAudio:   body.smoothAudio === true || body.smoothAudio === "true",
     crf:           body.crf || 21,
     preset:        body.preset || "faster",
     maxrate:       body.maxrate || "",
